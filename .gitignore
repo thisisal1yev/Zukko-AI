@@ -1,0 +1,6 @@
+.env
+zukkotutor.db
+*.jpg
+__pycache__/
+*.pyc
+.venv/

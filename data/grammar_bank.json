@@ -1,0 +1,104 @@
+{
+  "questions": [
+    {
+      "q": "Choose the correct sentence:",
+      "options": [
+        "She has been living here since three years.",
+        "She has been living here for three years.",
+        "She is living here since three years.",
+        "She lived here for three years ago."
+      ],
+      "correct": 1
+    },
+    {
+      "q": "Which uses the article correctly?",
+      "options": [
+        "I need an advice about IELTS.",
+        "I need advice about the IELTS.",
+        "I need an advice about an IELTS.",
+        "I need some advice about IELTS."
+      ],
+      "correct": 3
+    },
+    {
+      "q": "Pick the best conditional:",
+      "options": [
+        "If I will have time, I study.",
+        "If I had time, I would have studied.",
+        "If I have time, I will study.",
+        "If I have time, I would study."
+      ],
+      "correct": 2
+    },
+    {
+      "q": "Choose the correct passive:",
+      "options": [
+        "The essay was wrote yesterday.",
+        "The essay was written yesterday.",
+        "The essay written yesterday.",
+        "The essay has written yesterday."
+      ],
+      "correct": 1
+    },
+    {
+      "q": "Which collocation is natural?",
+      "options": [
+        "do a decision",
+        "make a decision",
+        "make an advice",
+        "do an effort"
+      ],
+      "correct": 1
+    },
+    {
+      "q": "Select the correct preposition:",
+      "options": [
+        "interested on",
+        "interested for",
+        "interested in",
+        "interested at"
+      ],
+      "correct": 2
+    },
+    {
+      "q": "Which relative clause is correct?",
+      "options": [
+        "The student which passed the test studied hard.",
+        "The student who passed the test studied hard.",
+        "The student what passed the test studied hard.",
+        "The student whom passed the test studied hard."
+      ],
+      "correct": 1
+    },
+    {
+      "q": "Pick the correct parallel structure:",
+      "options": [
+        "He likes swimming, running, and to hike.",
+        "He likes swimming, running, and hiking.",
+        "He likes swim, run, and hike.",
+        "He likes to swim, running, and hiking."
+      ],
+      "correct": 1
+    },
+    {
+      "q": "Choose the correct reported speech:",
+      "options": [
+        "She said me to wait.",
+        "She told me to wait.",
+        "She said to me wait.",
+        "She told that I wait."
+      ],
+      "correct": 1
+    },
+    {
+      "q": "Which sentence avoids redundancy?",
+      "options": [
+        "Personally, in my opinion, I think education is important.",
+        "Education is important.",
+        "In my opinion personally I think education is important to me.",
+        "I personally think that in my opinion education is important."
+      ],
+      "correct": 1
+    }
+  ]
+}
