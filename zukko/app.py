@@ -4,8 +4,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import random
-import re
 from pathlib import Path
 
 import telebot
@@ -35,46 +33,49 @@ _MIN_ESSAY_LEN = 40
 
 MENU_WRITING = lambda mode: f"✍️ {mode} Writing Tahlili"
 BTN_TUTOR = "🤖 AI Tutor (Savol-javob)"
-BTN_SPEAKING = "🎤 AI Speaking Tutor"
-BTN_TEST = "📝 Daraja Aniqlash Testi"
-BTN_STREAK = "🔥 Mening Streakim"
 BTN_DIRECTION = "⬅️ Yo'nalish"
-BTN_DASH = "📊 Progress Dashboard"
-BTN_SAMPLES = "📚 Namunalar"
-BTN_ERRORS = "📖 Xato lug'ati"
-BTN_TEACHER = "👨‍🏫 O'qituvchi bog'lash"
-BTN_CHALLENGE = "✨ Kunlik mini-challenge"
+BTN_TEACHER = "👨‍🏫 Guruhga qo'shilish"
 BTN_VOCAB = "📚 Vocabulary Booster"
 BTN_PARAPHRASE = "🔁 Paraphrase o'yini"
-BTN_UPGRADE = "⬆️ Upgrade so'z"
-BTN_HELP = "😰 Writing yordam"
 
 TASK_BTN = {"📊 Task 1": "task1", "📝 Task 2": "task2", "✉️ Letter": "letter"}
 
 IELTS_START = "🇬🇧 IELTS Yo'nalishi"
 CEFR_START = "🇺🇿 CEFR (Multi-level)"
 
+# Yangi tugmalar (tanga tizimi)
+BTN_BALANCE    = "💰 Mening Tangalarim"
+BTN_UPGRADE_COINS = "➕ Tanga to'ldirish"
+BTN_GROUP_REPORT = "👥 Guruh Hisoboti"
+BTN_PROFILE = "👤 Profil"
+BTN_BACK = "🔙 Orqaga"
+BTN_EXIT_GAME = "🚪 O'yindan chiqish"
+
+# Rol tanlash tugmalari
+BTN_ROLE_STUDENT = "👨‍🎓 O'quvchi"
+BTN_ROLE_TEACHER = "👨‍🏫 O'qituvchi"
+
+# O'qituvchi menyusi uchun tugmalar
+BTN_CREATE_GROUP = "➕ Guruh yaratish"
+BTN_MY_GROUPS = "📋 Mening guruhlarim"
+
 _ALL_MENU_BUTTONS = frozenset(
     {
         BTN_TUTOR,
-        BTN_SPEAKING,
-        BTN_TEST,
-        BTN_STREAK,
         BTN_DIRECTION,
-        BTN_DASH,
-        BTN_SAMPLES,
-        BTN_ERRORS,
         BTN_TEACHER,
-        BTN_CHALLENGE,
         BTN_VOCAB,
         BTN_PARAPHRASE,
-        BTN_UPGRADE,
-        BTN_HELP,
         IELTS_START,
         CEFR_START,
-        "🔙 Orqaga",
-        "🎙 Task 1 maslahat",
-        "🎙 Task 2 maslahat",
+        BTN_BACK,
+        BTN_BALANCE,
+        BTN_UPGRADE_COINS,
+        BTN_GROUP_REPORT,
+        BTN_PROFILE,
+        BTN_EXIT_GAME,
+        BTN_CREATE_GROUP,
+        BTN_MY_GROUPS,
     }
     | set(TASK_BTN.keys())
 )
@@ -110,27 +111,61 @@ def _load_json(path: Path) -> dict:
 
 
 def main_menu_markup(user_id: int) -> types.ReplyKeyboardMarkup:
+    """O'quvchi uchun asosiy menyu."""
     row = db.get_user_row(user_id)
     mode = row["mode"] if row else "IELTS"
     m = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
     m.add(
         MENU_WRITING(mode),
         BTN_TUTOR,
-        BTN_SPEAKING,
-        BTN_TEST,
-        BTN_CHALLENGE,
-        BTN_STREAK,
-        BTN_DASH,
-        BTN_SAMPLES,
-        BTN_ERRORS,
-        BTN_TEACHER,
         BTN_VOCAB,
         BTN_PARAPHRASE,
-        BTN_UPGRADE,
-        BTN_HELP,
+        BTN_BALANCE,
+        BTN_PROFILE,
+        BTN_UPGRADE_COINS,
+        BTN_TEACHER,
         BTN_DIRECTION,
     )
     return m
+
+
+def teacher_menu_markup(user_id: int) -> types.ReplyKeyboardMarkup:
+    """O'qituvchi uchun asosiy menyu."""
+    row = db.get_user_row(user_id)
+    mode = row["mode"] if row else "IELTS"
+    m = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    m.add(
+        BTN_PROFILE,
+        BTN_CREATE_GROUP,
+        BTN_MY_GROUPS,
+        BTN_BALANCE,
+        BTN_UPGRADE_COINS,
+        BTN_GROUP_REPORT,
+        BTN_DIRECTION,
+    )
+    return m
+
+
+def _blocked_states() -> frozenset:
+    """Qaysi state lar fallback dan himoyalanganligini qaytaradi."""
+    return frozenset((
+        "await_teacher_id",
+        "waiting_writing",
+        "pick_task",
+        "await_paraphrase",
+        "await_vocab_topic",
+        "paraphrase_payment_pick",
+        "group_report_period_pick",
+        "reg_ask_fullname",
+        "reg_ask_phone",
+        "reg_ask_role",
+        "profile_edit_firstname",
+        "profile_edit_lastname",
+        "profile_edit_phone",
+        "await_group_code",
+        "await_create_group_name",
+        "group_menu_idle",
+    ))
 
 
 def task_pick_markup() -> types.ReplyKeyboardMarkup:
@@ -159,6 +194,45 @@ def process_writing(
     transcript_source: str | None,
     image_path: str | None,
 ) -> None:
+    # Kunlik limit tekshiruvi
+    writing_today = db.get_daily_writing_count(user_id)
+    row = db.get_user_row(user_id)
+    role = row["role"] if row else "STUDENT"
+    tariff = row["tariff"] if row else "FREE"
+
+    # O'qituvchi PRO/PREMIUM — bepul
+    if role == "TEACHER" and tariff in ("PRO", "PREMIUM"):
+        cost = 0.0
+    elif writing_today < config.WRITING_DAILY_FREE:
+        # Kunlik bepul limit ichida
+        cost = 0.0
+    else:
+        # Bepul limitdan keyin — to'lov
+        cost = config.WRITING_EXTRA_COST if writing_today >= config.WRITING_DAILY_FREE else config.WRITING_ANALYSIS_COST
+        if not db.check_coins(user_id, cost):
+            bot.send_message(
+                chat_id,
+                f"❌ Writing tahlili uchun yetarli tanga yo'q.\n\n"
+                f"💰 Kerak: {cost} tanga\n"
+                f"📊 Balans: {db.get_coins(user_id):.1f} tanga\n\n"
+                f"Kunlik {config.WRITING_DAILY_FREE} ta bepul tahlildingiz tugagan.",
+                reply_markup=main_menu_markup(user_id),
+            )
+            return
+
+    # Tanga yechish (agar pullik bo'lsa)
+    if cost > 0:
+        ok, balance = db.deduct_coins(user_id, cost, "writing_analysis")
+        if not ok:
+            bot.send_message(
+                chat_id,
+                f"❌ Yetarli tanga yo'q. Kerak: {cost} tanga, balans: {balance:.1f}",
+                reply_markup=main_menu_markup(user_id),
+            )
+            return
+
+    bot.send_message(chat_id, "🧐 AI examiner tahlil qilmoqda...")
+
     err_summary = db.get_error_summary_for_prompt(user_id, task_type)
     full_prompt = prompts.writing_examiner_prompt(mode, task_type, err_summary)
 
@@ -208,6 +282,7 @@ def process_writing(
         db.upsert_errors(user_id, task_type, clean)
 
     db.record_daily_activity(user_id, met_goal=True)
+    db.increment_daily_writing(user_id)
     ur = db.get_user_row(user_id)
     streak = int(ur["streak_current"] or 0) if ur else 0
     best = int(ur["streak_best"] or 0) if ur else 0
@@ -234,7 +309,8 @@ def process_writing(
         },
     )
 
-    footer = f"\n\n🔥 Streak: {streak} | Rekord: {best}\n📚 Vocabulary: tugmalardan foydalaning."
+    cost_note = f"\n💰 Tanga yechildi: {cost}" if cost > 0 else ""
+    footer = f"\n\n🔥 Streak: {streak} | Rekord: {best}\n📚 Vocabulary: tugmalardan foydalaning.{cost_note}"
     bot.send_message(chat_id, (feedback_text or "Tahlil.") + footer)
 
     demo = db.update_low_band_streak(
@@ -282,14 +358,46 @@ def cmd_start(message: types.Message) -> None:
     uid = _user_id(message)
     if uid is None:
         return
+
+    # Telegram ma'lumotlarini avtomatik saqlash
+    first_name = message.from_user.first_name or ""
+    last_name = message.from_user.last_name or ""
+    telegram_username = message.from_user.username or ""
+
     db.ensure_user(uid)
+    db.update_user_profile(uid, first_name=first_name, last_name=last_name, telegram_username=telegram_username)
+
+    # Agar allaqachon ro'yxatdan o'tgan bo'lsa — menyu
+    if db.is_registered(uid):
+        bonus_given = False
+        welcome_msg = "Zukko AI Tutorga qayta xush kelibsiz!"
+    else:
+        # Bitta transaction da: bonus
+        bonus_given = db.ensure_user_with_bonus(uid, config.INITIAL_COINS_BONUS)
+        welcome_msg = (
+            f"🎓 Zukko AI Tutorga xush kelibsiz, {first_name}!\n\n"
+            f"To'liq ro'yxatdan o'tish uchun:\n\n"
+            f"1️⃣ Ism va familiyangizni kiriting\n"
+            f"2️⃣ Telefon raqamingizni 📱 Contact tugmasi orqali yuboring\n\n"
+            f"Ism va familiyangizni kiriting:"
+        )
+        db.set_session(uid, "reg_ask_fullname", {})
+
     m = types.ReplyKeyboardMarkup(resize_keyboard=True)
     m.add(IELTS_START, CEFR_START)
-    bot.send_message(
-        message.chat.id,
-        "Zukko AI Tutorga xush kelibsiz! Yo'nalishni tanlang:",
-        reply_markup=m,
-    )
+    if not db.is_registered(uid):
+        bot.send_message(message.chat.id, welcome_msg)
+    else:
+        if bonus_given:
+            welcome_msg += f"\n\n🎁 Sizga {config.INITIAL_COINS_BONUS:.0f} tanga bonus berildi!"
+        # Rolga qarab menyu ko'rsatish
+        row = db.get_user_row(uid)
+        role = row["role"] if row else "STUDENT"
+        if role == "TEACHER":
+            markup = teacher_menu_markup(uid)
+        else:
+            markup = main_menu_markup(uid)
+        bot.send_message(message.chat.id, welcome_msg, reply_markup=markup)
 
 
 @bot.message_handler(commands=["cancel"])
@@ -301,10 +409,245 @@ def cmd_cancel(message: types.Message) -> None:
     bot.send_message(message.chat.id, "Bekor qilindi.", reply_markup=main_menu_markup(uid))
 
 
+# =============================================================================
+# REGISTRATSIYA HANDLERLARI
+# =============================================================================
+
+def _registration_active(state: str) -> bool:
+    """Registratsiya jarayonidagi state larni tekshiradi."""
+    return state.startswith("reg_")
+
+
+@bot.message_handler(func=lambda m: _sess_state(m, "reg_ask_fullname"))
+def on_reg_fullname(message: types.Message) -> None:
+    uid = _user_id(message)
+    if uid is None or not message.text:
+        return
+    fullname = message.text.strip()
+    if not fullname or len(fullname) < 3:
+        bot.send_message(message.chat.id, "❌ Iltimos, ism va familiyangizni to'liq kiriting (kamida 3 ta harf):")
+        return
+    # Ism va familiyani ajratish
+    parts = fullname.split()
+    first_name = parts[0] if len(parts) > 0 else fullname
+    last_name = parts[-1] if len(parts) > 1 else ""
+    db.update_user_profile(uid, first_name=first_name, last_name=last_name)
+    db.set_session(uid, "reg_ask_phone", {})
+    # Telefon raqam share qilish tugmasi
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.add(types.KeyboardButton("📱 Telefon raqamni yuborish", request_contact=True))
+    bot.send_message(
+        message.chat.id,
+        f"✅ {first_name}, endi telefon raqamingizni yuboring:\n\n"
+        f"Pastdagi tugmani bosing:",
+        reply_markup=kb,
+    )
+
+
+@bot.message_handler(content_types=["contact"], func=lambda m: _sess_state(m, "reg_ask_phone"))
+def on_reg_phone_contact(message: types.Message) -> None:
+    uid = _user_id(message)
+    if uid is None:
+        return
+    contact = message.contact
+    if not contact:
+        bot.send_message(message.chat.id, "❌ Iltimos, telefon raqamingizni yuboring:")
+        return
+    phone = contact.phone_number
+    db.update_user_profile(uid, phone=phone)
+    # Rol tanlash bosqichiga o'tish
+    db.set_session(uid, "reg_ask_role", {})
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton(BTN_ROLE_STUDENT, callback_data="role_student"))
+    kb.add(types.InlineKeyboardButton(BTN_ROLE_TEACHER, callback_data="role_teacher"))
+    bot.send_message(
+        message.chat.id,
+        f"✅ {contact.first_name}, endi rolingizni tanlang:",
+        reply_markup=kb,
+    )
+
+
+@bot.message_handler(
+    func=lambda m: m.content_type == "text" and _sess_state(m, "reg_ask_phone")
+)
+def on_reg_phone_text(message: types.Message) -> None:
+    """Agar foydalanuvchi contact share qilmasa, matn kiritishga ruxsat."""
+    uid = _user_id(message)
+    if uid is None or not message.text:
+        return
+    phone = message.text.strip()
+    if not phone or len(phone) < 7:
+        bot.send_message(message.chat.id, "❌ Iltimos, to'g'ri telefon raqam kiriting:")
+        return
+    db.update_user_profile(uid, phone=phone)
+    # Rol tanlash bosqichiga o'tish
+    db.set_session(uid, "reg_ask_role", {})
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton(BTN_ROLE_STUDENT, callback_data="role_student"))
+    kb.add(types.InlineKeyboardButton(BTN_ROLE_TEACHER, callback_data="role_teacher"))
+    bot.send_message(
+        message.chat.id,
+        f"✅ Endi rolingizni tanlang:",
+        reply_markup=kb,
+    )
+
+
+def _check_channel_subscription(user_id: int, chat_id: int) -> None:
+    """
+    Foydalanuvchi kanallarga obuna bo'lganligini tekshiradi.
+    Agar bo'lmagan bo'lsa — obuna bo'lish tugmalarini ko'rsatadi.
+    """
+    if not config.PROJECT_CHANNEL or not config.SPONSOR_CHANNEL:
+        # Kanal sozlanmagan bo'lsa — to'g'ridan-to'g'ri davom etish
+        _complete_registration(user_id, chat_id)
+        return
+
+    # Agar avval obuna bo'lgan bo'lsa — davom etish
+    if db.is_channels_subscribed(user_id):
+        _complete_registration(user_id, chat_id)
+        return
+
+    # Obuna bo'lishni tekshirish
+    try:
+        member1 = bot.get_chat_member(f"@{config.PROJECT_CHANNEL}", user_id)
+        member2 = bot.get_chat_member(f"@{config.SPONSOR_CHANNEL}", user_id)
+        if member1.status in ("member", "administrator", "creator") and member2.status in ("member", "administrator", "creator"):
+            db.mark_channels_subscribed(user_id)
+            _complete_registration(user_id, chat_id)
+            return
+    except Exception as e:
+        logger.warning("Channel subscription check failed: %s", e)
+        # Bot kanal admini emas yoki kanal topilmadi — registratsiyani tugatish
+        # Foydalanuvchini "stuck" qoldirmaslik uchun
+        _complete_registration(user_id, chat_id)
+        return
+
+    # Obuna bo'lmagan — tugmalar ko'rsatish
+    markup = types.InlineKeyboardMarkup()
+    if config.PROJECT_CHANNEL_URL:
+        markup.add(types.InlineKeyboardButton("📢 Project Kanal", url=config.PROJECT_CHANNEL_URL))
+    if config.SPONSOR_CHANNEL_URL:
+        markup.add(types.InlineKeyboardButton("🤝 Sponsor Kanal", url=config.SPONSOR_CHANNEL_URL))
+    markup.add(types.InlineKeyboardButton("✅ Obuna bo'ldim, davom etish", callback_data="check_subscription"))
+
+    bot.send_message(
+        chat_id,
+        "⚠️ Botdan foydalanish uchun quyidagi kanallarga obuna bo'ling:\n\n"
+        "📢 *Project Kanal*\n"
+        "🤝 *Sponsor Kanal*\n\n"
+        "Obuna bo'lgach, pastdagi tugmani bosing:",
+        parse_mode="Markdown",
+        reply_markup=markup,
+    )
+
+
+@bot.callback_query_handler(func=lambda call: call.data in ("role_student", "role_teacher"))
+def on_role_select(call: types.CallbackQuery) -> None:
+    """Rol tanlash callback handler."""
+    uid = call.from_user.id
+    role = "STUDENT" if call.data == "role_student" else "TEACHER"
+    db.set_user_role(uid, role)
+    db.mark_registeredGG(uid)  # Registratsiyani tugatish
+    bot.answer_callback_query(call.id, f"✅ Rol tanlandi: {'O\'quvchi' if role == 'STUDENT' else 'O\'qituvchi'}")
+    bot.delete_message(call.message.chat.id, call.message.message_id)
+    # Kanal obunasini tekshirish
+    _check_channel_subscription(uid, call.message.chat.id)
+
+
+def _complete_registration(user_id: int, chat_id: int) -> None:
+    """Registratsiyani tugallash va menyuni ko'rsatish."""
+    row = db.get_user_row(user_id)
+    fn = row["first_name"] if row else "Foydalanuvchi"
+    role = row["role"] if row else "STUDENT"
+    bonus = db.get_coins(user_id)
+
+    # Rolga qarab menyu ko'rsatish
+    if role == "TEACHER":
+        kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+        kb.add(IELTS_START, CEFR_START)
+        bot.send_message(
+            chat_id,
+            f"🎉 Tabriklaymiz, {fn}! O'qituvchi sifatida ro'yxatdan o'tdingiz!\n\n"
+            f"💰 Balansingiz: {bonus:.0f} tanga\n\n"
+            f"Endi yo'nalishni tanlang:",
+            reply_markup=kb,
+        )
+    else:
+        kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+        kb.add(IELTS_START, CEFR_START)
+        bot.send_message(
+            chat_id,
+            f"🎉 Tabriklaymiz, {fn}! Ro'yxatdan o'tdingiz!\n\n"
+            f"💰 Balansingiz: {bonus:.0f} tanga\n\n"
+            f"Endi yo'nalishni tanlang:",
+            reply_markup=kb,
+        )
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "check_subscription")
+def on_check_subscription(call: types.CallbackQuery) -> None:
+    uid = call.from_user.id
+
+    # Agar kanallar sozlanmagan bo'lsa — to'g'ridan-to'g'ri davom etish
+    if not config.PROJECT_CHANNEL or not config.SPONSOR_CHANNEL:
+        db.mark_channels_subscribed(uid)
+        bot.answer_callback_query(call.id, "✅ Tasdiqlandi!")
+        bot.delete_message(call.message.chat.id, call.message.message_id)
+        _complete_registration(uid, call.message.chat.id)
+        return
+
+    try:
+        member1 = bot.get_chat_member(f"@{config.PROJECT_CHANNEL}", uid)
+        member2 = bot.get_chat_member(f"@{config.SPONSOR_CHANNEL}", uid)
+        if member1.status in ("member", "administrator", "creator") and member2.status in ("member", "administrator", "creator"):
+            db.mark_channels_subscribed(uid)
+            bot.answer_callback_query(call.id, "✅ Obuna tasdiqlandi!")
+            bot.delete_message(call.message.chat.id, call.message.message_id)
+            _complete_registration(uid, call.message.chat.id)
+        else:
+            bot.answer_callback_query(call.id, "❌ Siz hali kanallarga obuna bo'lmagansiz!", show_alert=True)
+    except Exception as e:
+        error_msg = str(e)
+        logger.warning("Subscription check callback failed: %s", e)
+
+        # Agar kanal topilmasa — foydalanuvchiga aniq xabar
+        if "chat not found" in error_msg.lower() or "bad request" in error_msg.lower():
+            # Fallback: qo'lda tasdiqlash tugmasi
+            markup = types.InlineKeyboardMarkup()
+            markup.add(types.InlineKeyboardButton("✅ Men obuna bo'ldim (tasdiqlash)", callback_data="confirm_subscribed_manual"))
+            bot.send_message(
+                call.message.chat.id,
+                "⚠️ Kanallar tekshirishda xatolik yuz berdi.\n\n"
+                "Iltimos, quyidagi kanallarga obuna bo'ling:\n"
+                f"📢 {config.PROJECT_CHANNEL_URL}\n"
+                f"🤝 {config.SPONSOR_CHANNEL_URL}\n\n"
+                "Obuna bo'lgach, pastdagi tugmani bosing:",
+                reply_markup=markup,
+            )
+            bot.answer_callback_query(call.id, "⚠️ Kanal topilmadi. Qo'lda tasdiqlang.", show_alert=True)
+        else:
+            bot.answer_callback_query(call.id, "❌ Xatolik yuz berdi. Qayta urinib ko'ring.", show_alert=True)
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "confirm_subscribed_manual")
+def on_manual_subscription_confirm(call: types.CallbackQuery) -> None:
+    """Foydalanuvchi qo'lda tasdiqlaganda."""
+    uid = call.from_user.id
+    db.mark_channels_subscribed(uid)
+    bot.answer_callback_query(call.id, "✅ Tasdiqlandi!")
+    # Barcha kanal xabarlarini o'chirish
+    bot.delete_message(call.message.chat.id, call.message.message_id)
+    _complete_registration(uid, call.message.chat.id)
+
+
 def _direction_filter(message: types.Message) -> bool:
     if not message.text:
         return False
     t = message.text
+    uid = _user_id(message)
+    if uid and not db.is_registered(uid):
+        bot.send_message(message.chat.id, "⚠️ Avval ro'yxatdan o'ting. /start ni bosing.")
+        return False
     return t == BTN_DIRECTION or t in (IELTS_START, CEFR_START)
 
 
@@ -324,21 +667,68 @@ def on_direction(message: types.Message) -> None:
     mode = "IELTS" if text == IELTS_START else "CEFR"
     db.ensure_user(uid)
     db.set_user_mode(uid, mode)
-    bot.send_message(
-        message.chat.id,
-        f"✅ {mode} rejasi faollashdi!",
-        reply_markup=main_menu_markup(uid),
-    )
+    # Rolga qarab menyu ko'rsatish
+    row = db.get_user_row(uid)
+    role = row["role"] if row else "STUDENT"
+    if role == "TEACHER":
+        bot.send_message(
+            message.chat.id,
+            f"✅ {mode} rejasi faollashdi!",
+            reply_markup=teacher_menu_markup(uid),
+        )
+    else:
+        bot.send_message(
+            message.chat.id,
+            f"✅ {mode} rejasi faollashdi!",
+            reply_markup=main_menu_markup(uid),
+        )
 
 
 def _starts_writing(text: str) -> bool:
     return text.startswith("✍️") and "Writing" in text
 
 
+def _check_channel_or_block(uid: int, chat_id: int) -> bool:
+    """
+    Kanal obunasini tekshiradi. Agar bo'lmasa — xabar yuboradi va False qaytaradi.
+    Agar bo'lsa yoki kanal sozlanmagan bo'lsa — True qaytaradi.
+    """
+    if not config.PROJECT_CHANNEL or not config.SPONSOR_CHANNEL:
+        return True
+    if db.is_channels_subscribed(uid):
+        return True
+    # Qayta tekshirish
+    try:
+        member1 = bot.get_chat_member(f"@{config.PROJECT_CHANNEL}", uid)
+        member2 = bot.get_chat_member(f"@{config.SPONSOR_CHANNEL}", uid)
+        if member1.status in ("member", "administrator", "creator") and member2.status in ("member", "administrator", "creator"):
+            db.mark_channels_subscribed(uid)
+            return True
+    except Exception:
+        pass
+    # Obuna bo'lmagan — tugma ko'rsatish
+    markup = types.InlineKeyboardMarkup()
+    if config.PROJECT_CHANNEL_URL:
+        markup.add(types.InlineKeyboardButton("📢 Project Kanal", url=config.PROJECT_CHANNEL_URL))
+    if config.SPONSOR_CHANNEL_URL:
+        markup.add(types.InlineKeyboardButton("🤝 Sponsor Kanal", url=config.SPONSOR_CHANNEL_URL))
+    markup.add(types.InlineKeyboardButton("✅ Obuna bo'ldim", callback_data="check_subscription"))
+    markup.add(types.InlineKeyboardButton("✅ Men obuna bo'ldim (tasdiqlash)", callback_data="confirm_subscribed_manual"))
+    bot.send_message(
+        chat_id,
+        "⚠️ Botdan foydalanish uchun kanallarga obuna bo'ling:\n\n"
+        "Obuna bo'lgach, pastdagi tugmani bosing:",
+        reply_markup=markup,
+    )
+    return False
+
+
 @bot.message_handler(func=lambda m: bool(m.text and _starts_writing(m.text)))
 def on_writing_menu(message: types.Message) -> None:
     uid = _user_id(message)
     if uid is None:
+        return
+    if not _check_channel_or_block(uid, message.chat.id):
         return
     bot.send_message(
         message.chat.id,
@@ -444,452 +834,114 @@ def on_essay_text(message: types.Message) -> None:
 
 @bot.message_handler(func=lambda m: m.text == BTN_TUTOR)
 def on_tutor_hint(message: types.Message) -> None:
+    uid = _user_id(message)
+    if uid is None:
+        return
+    if not _check_channel_or_block(uid, message.chat.id):
+        return
     bot.send_message(message.chat.id, "Savolingizni yozing — ingliz tili o'qituvchisi sifatida javob beraman.")
-
-
-@bot.message_handler(func=lambda m: m.text == BTN_SPEAKING)
-def on_speaking_entry(message: types.Message) -> None:
-    uid = _user_id(message)
-    if uid is None:
-        return
-    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.add("🎙 Task 1 maslahat", "🎙 Task 2 maslahat", "🔙 Orqaga")
-    bot.send_message(message.chat.id, "Speaking: qaysi task bo'yicha?", reply_markup=kb)
-    db.set_session(uid, "speaking_pick", {})
-
-
-@bot.message_handler(
-    func=lambda m: m.text in ("🎙 Task 1 maslahat", "🎙 Task 2 maslahat", "🔙 Orqaga")
-    and _sess_state(m, "speaking_pick")
-)
-def on_speaking_pick(message: types.Message) -> None:
-    uid = _user_id(message)
-    if uid is None:
-        return
-    st = message.text
-    if st == "🔙 Orqaga":
-        db.clear_session(uid)
-        bot.send_message(message.chat.id, "Menyu:", reply_markup=main_menu_markup(uid))
-        return
-    if st is None:
-        return
-    tt = "task1" if "Task 1" in st else "task2"
-    row = db.get_user_row(uid)
-    mode = row["mode"] if row else "IELTS"
-    db.set_session(uid, "speaking_coach", {"task_type": tt, "mode": mode})
-    bot.send_message(
-        message.chat.id,
-        "Speaking haqida savolingizni yozing (matn).",
-        reply_markup=main_menu_markup(uid),
-    )
-
-
-@bot.message_handler(
-    func=lambda m: m.content_type == "text"
-    and _sess_state(m, "speaking_coach")
-    and (m.text not in _ALL_MENU_BUTTONS)
-    and (not _starts_writing(m.text or ""))
-)
-def on_speaking_chat(message: types.Message) -> None:
-    uid = _user_id(message)
-    if uid is None:
-        return
-    qtext = message.text or ""
-    ctx = db.session_context(uid)
-    tt = ctx.get("task_type", "task2")
-    mode = ctx.get("mode", "IELTS")
-    sys_p = prompts.speaking_tutor_system(mode, tt)
-    res = ask_text_safe(f"{sys_p}\n\nSavol: {qtext}", timeout=90)
-    bot.reply_to(message, res)
-
-
-@bot.message_handler(func=lambda m: m.text == BTN_TEST)
-def on_level_test(message: types.Message) -> None:
-    uid = _user_id(message)
-    if uid is None:
-        return
-    bank = _load_json(GRAMMAR_BANK_PATH).get("questions") or []
-    if len(bank) < 5:
-        row = db.get_user_row(uid)
-        mode = row["mode"] if row else "IELTS"
-        sample = '{"questions":[{"q":"...","options":["a","b","c","d"],"correct":1}]}'
-        raw = ask_text_safe(prompts.grammar_test_generation(mode, sample), timeout=90)
-        blob = extract_json_blob(raw) or {}
-        bank = blob.get("questions") or []
-    if not bank:
-        bot.send_message(message.chat.id, "Test banki hozircha bo'sh.")
-        return
-    rng = random.Random(int(__import__("datetime").date.today().strftime("%Y%m%d")) + uid)
-    picks = rng.sample(bank, min(5, len(bank)))
-    db.set_session(uid, "grammar_quiz", {"questions": picks, "idx": 0, "correct": 0})
-    _send_grammar_question(message.chat.id, picks[0], 0, len(picks))
-
-
-def _send_grammar_question(chat_id: int, q: dict, idx: int, total: int) -> None:
-    opts = q.get("options") or []
-    lines = [f"Savol {idx+1}/{total}: {q.get('q','')}\n"]
-    for i, o in enumerate(opts):
-        lines.append(f"{i}. {o}")
-    kb = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=1)
-    for i in range(len(opts)):
-        kb.add(str(i))
-    bot.send_message(chat_id, "\n".join(lines), reply_markup=kb)
-
-
-@bot.message_handler(
-    func=lambda m: m.text is not None
-    and re.fullmatch(r"\d+", (m.text or "").strip() or "")
-    and _sess_state(m, "grammar_quiz")
-)
-def on_grammar_answer(message: types.Message) -> None:
-    uid = _user_id(message)
-    if uid is None:
-        return
-    gt = message.text
-    if gt is None:
-        return
-    ctx = db.session_context(uid)
-    picks = ctx.get("questions") or []
-    idx = int(ctx.get("idx") or 0)
-    correct_n = int(ctx.get("correct") or 0)
-    choice = int(gt.strip())
-    q = picks[idx] if idx < len(picks) else None
-    if not q:
-        db.clear_session(uid)
-        return
-    ok = q.get("correct")
-    if choice == ok:
-        correct_n += 1
-    idx += 1
-    if idx >= len(picks):
-        db.save_grammar_result(uid, correct_n, len(picks), {"detail": "daily_grammar"})
-        db.record_daily_activity(uid, met_goal=True)
-        db.clear_session(uid)
-        bot.send_message(
-            message.chat.id,
-            f"Test yakunlandi: {correct_n}/{len(picks)}.\nZo'r! Kunlik maqsad uchun streak yangilandi.",
-            reply_markup=main_menu_markup(uid),
-        )
-        return
-    db.set_session(uid, "grammar_quiz", {"questions": picks, "idx": idx, "correct": correct_n})
-    _send_grammar_question(message.chat.id, picks[idx], idx, len(picks))
-
-
-@bot.message_handler(func=lambda m: m.text == BTN_STREAK)
-def on_streak(message: types.Message) -> None:
-    uid = _user_id(message)
-    if uid is None:
-        return
-    row = db.get_user_row(uid)
-    sc = row["streak_current"] if row else 0
-    sb = row["streak_best"] if row else 0
-    dg = row["daily_goal_met_date"] if row else None
-    from datetime import date
-
-    today = date.today().isoformat()
-    goal = "✅ bajarilgan" if dg == today else "⬜ hali yo'q"
-    bot.send_message(
-        message.chat.id,
-        f"🔥 Ketma-ket kunlar: {sc}\n🏆 Rekord: {sb}\n🎯 Bugungi maqsad: {goal}",
-        reply_markup=main_menu_markup(uid),
-    )
-
-
-@bot.message_handler(func=lambda m: m.text == BTN_DASH)
-def on_dashboard(message: types.Message) -> None:
-    uid = _user_id(message)
-    if uid is None:
-        return
-    weak = db.get_weak_areas_summary(uid)
-    row = db.get_user_row(uid)
-    from datetime import date
-
-    today = date.today().isoformat()
-    dg = row["daily_goal_met_date"] if row else None
-    goal = "bajarilgan" if dg == today else "kutilmoqda"
-    sc = row["streak_current"] if row else 0
-    last = db.get_last_scores(uid)
-    band = last["overall_band"] if last else "-"
-    cefr = last["cefr_level"] if last else "-"
-    bot.send_message(
-        message.chat.id,
-        f"📊 Dashboard\nStreak: {sc}\nBugungi maqsad: {goal}\nSo'nggi band≈{band} CEFR={cefr}\n\n{weak}",
-        reply_markup=main_menu_markup(uid),
-    )
-
-
-@bot.message_handler(func=lambda m: m.text == BTN_SAMPLES)
-def on_samples(message: types.Message) -> None:
-    data = _load_json(SAMPLES_PATH)
-    uid = _user_id(message)
-    if uid is None:
-        return
-    row = db.get_user_row(uid)
-    task = row["preferred_task"] if row else "task2"
-    sec = data.get(task) or data.get("task2") or {}
-    if not sec:
-        bot.send_message(message.chat.id, "Namunalar hozircha yo'q.")
-        return
-    for band in ("6", "7", "8", "9"):
-        txt = sec.get(band)
-        if txt:
-            bot.send_message(message.chat.id, f"Band {band} namunasi:\n\n{txt}")
-    bot.send_message(message.chat.id, "Tugadi.", reply_markup=main_menu_markup(uid))
-
-
-@bot.message_handler(func=lambda m: m.text == BTN_ERRORS)
-def on_errors(message: types.Message) -> None:
-    uid = _user_id(message)
-    if uid is None:
-        return
-    with db.get_conn() as conn:
-        cur = conn.execute(
-            """SELECT task_type, error_category, count, example_snippet FROM errors_log
-               WHERE user_id = ? ORDER BY count DESC LIMIT 15""",
-            (uid,),
-        )
-        rows = cur.fetchall()
-    if not rows:
-        bot.send_message(message.chat.id, "Xatolar lug'ati hozircha bo'sh.", reply_markup=main_menu_markup(uid))
-        return
-    lines = ["📖 Xato lug'ati (top):"]
-    for r in rows:
-        lines.append(f"• [{r['task_type']}] {r['error_category']} ×{r['count']}")
-    bot.send_message(message.chat.id, "\n".join(lines), reply_markup=main_menu_markup(uid))
 
 
 @bot.message_handler(func=lambda m: m.text == BTN_TEACHER)
 def on_teacher_link(message: types.Message) -> None:
+    """O'quvchi uchun: guruhga qo'shilish (kod kiritish)."""
     uid = _user_id(message)
     if uid is None:
         return
-    db.set_session(uid, "await_teacher_id", {})
+    row = db.get_user_row(uid)
+    role = row["role"] if row else "STUDENT"
+
+    # Agar o'qituvchi bo'lsa — guruh yaratishga yo'naltirish
+    if role == "TEACHER":
+        on_create_group_menu(message)
+        return
+
+    # O'quvchi — allaqachon guruhda bo'lsa
+    user_dict = dict(row)
+    group_id = user_dict.get("group_id")
+    if group_id:
+        group = db.get_group_by_id(group_id)
+        if group:
+            teacher = db.get_user_row(group["teacher_id"])
+            teacher_name = teacher["first_name"] if teacher and teacher["first_name"] else "O'qituvchi"
+            bot.send_message(
+                message.chat.id,
+                f"🏫 Siz allaqachon guruhdasiz:\n\n"
+                f"📌 Guruh: <b>{group['name']}</b>\n"
+                f"👨‍🏫 O'qituvchi: <b>{teacher_name}</b>\n"
+                f"🔑 Kod: <code>{group['join_code']}</code>",
+                parse_mode="HTML",
+                reply_markup=main_menu_markup(uid),
+            )
+            return
+
+    # Guruhga qo'shilish — kod kiritish
+    db.set_session(uid, "await_group_code", {})
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.add(BTN_BACK)
     bot.send_message(
         message.chat.id,
-        "O'qituvchining Telegram `user_id` (raqam) yuboring. O'qituvchi @userinfobot orqali olishi mumkin.",
-        parse_mode="Markdown",
+        "🏫 <b>Guruhga qo'shilish</b>\n\n"
+        "O'qituvchingiz bergan <b>qo'shilish kodini</b> kiriting:\n\n"
+        "(Masalan: ABC12345)",
+        parse_mode="HTML",
+        reply_markup=kb,
     )
-
-
-@bot.message_handler(func=lambda m: m.content_type == "text" and _sess_state(m, "await_teacher_id"))
-def on_teacher_id(message: types.Message) -> None:
-    uid = _user_id(message)
-    if uid is None:
-        return
-    if not message.text or not message.text.strip().lstrip("-").isdigit():
-        bot.send_message(message.chat.id, "Faqat raqamli ID yuboring.")
-        return
-    tid = int(message.text.strip())
-    db.set_teacher_id(uid, tid)
-    db.clear_session(uid)
-    bot.send_message(
-        message.chat.id,
-        f"✅ O'qituvchi ID saqlandi: `{tid}`. Yangi yozuvlar shu chatga xabar qilinadi.",
-        reply_markup=main_menu_markup(uid),
-        parse_mode="Markdown",
-    )
-
-
-@bot.message_handler(func=lambda m: m.text == BTN_CHALLENGE)
-def on_daily_challenge(message: types.Message) -> None:
-    uid = _user_id(message)
-    if uid is None:
-        return
-    bank = _load_json(GRAMMAR_BANK_PATH).get("questions") or []
-    if not bank:
-        bot.send_message(message.chat.id, "Challenge uchun savollar yo'q.")
-        return
-    rng = random.Random(int(__import__("datetime").date.today().strftime("%Y%m%d")))
-    q = rng.choice(bank)
-    db.set_session(uid, "mini_challenge", {"q": q})
-    opts = q.get("options") or []
-    lines = ["✨ Kunlik mini-challenge\n", q.get("q", ""), ""]
-    for i, o in enumerate(opts):
-        lines.append(f"{i}. {o}")
-    kb = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=1)
-    for i in range(len(opts)):
-        kb.add(str(i))
-    bot.send_message(message.chat.id, "\n".join(lines), reply_markup=kb)
 
 
 @bot.message_handler(
-    func=lambda m: m.text is not None
-    and re.fullmatch(r"\d+", (m.text or "").strip() or "")
-    and _sess_state(m, "mini_challenge")
+    func=lambda m: m.content_type == "text" and _sess_state(m, "await_group_code")
 )
-def on_mini_answer(message: types.Message) -> None:
+def on_group_code_submit(message: types.Message) -> None:
+    """O'quvchi guruh kodini kiritganda."""
     uid = _user_id(message)
     if uid is None:
         return
-    mt = message.text
-    if mt is None:
+    if not message.text:
         return
-    ctx = db.session_context(uid)
-    q = ctx.get("q") or {}
-    choice = int(mt.strip())
-    ok = q.get("correct")
-    if choice == ok:
-        db.record_daily_activity(uid, met_goal=True)
-        msg = "✅ To'g'ri! Streak / maqsad yangilandi."
-    else:
-        msg = f"❌ Noto'g'ri. To'g'ri javob: {ok}"
-    db.clear_session(uid)
-    bot.send_message(message.chat.id, msg, reply_markup=main_menu_markup(uid))
-
-
-@bot.message_handler(func=lambda m: m.text == BTN_VOCAB)
-def on_vocab_booster(message: types.Message) -> None:
-    uid = _user_id(message)
-    if uid is None:
-        return
-    ctx = db.session_context(uid)
-    vocab = ctx.get("vocab") or {}
-    topic = vocab.get("topic") or "practice"
-    kws = vocab.get("keywords") or []
-    cols = vocab.get("collocations") or []
-    if not kws:
-        bot.send_message(
-            message.chat.id,
-            "Avval Writing tahlili qiling — so'zlar shu yerdan olinadi.",
-            reply_markup=main_menu_markup(uid),
-        )
-        return
-    lines = [f"Mavzu: {topic}\n", "Kalit so'zlar:", ", ".join(kws[:15])]
-    if cols:
-        lines.append("\nKollokatsiyalar:")
-        lines.append(", ".join(cols[:10]))
-    raw = ask_text_safe(prompts.vocab_pack_prompt(topic, kws, cols), timeout=90)
-    data = extract_json_blob(raw)
-    qs_raw = (data or {}).get("questions") if data else None
-    if not isinstance(qs_raw, list) or not qs_raw:
-        bot.send_message(message.chat.id, "\n".join(lines), reply_markup=main_menu_markup(uid))
-        return
-    qs: list = qs_raw
-    prev_ctx = dict(db.session_context(uid))
-    db.set_session(
-        uid,
-        "vocab_quiz",
-        {"questions": qs, "idx": 0, "correct": 0, "restore": prev_ctx},
-    )
-    _send_vocab_q(message.chat.id, qs[0], 0, len(qs))
-
-
-def _send_vocab_q(chat_id: int, q: dict, idx: int, total: int) -> None:
-    opts = q.get("options") or []
-    lines = [f"Quiz {idx+1}/{total}: {q.get('q','')}\n"]
-    for i, o in enumerate(opts):
-        lines.append(f"{i}. {o}")
-    kb = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=1)
-    for i in range(len(opts)):
-        kb.add(str(i))
-    bot.send_message(chat_id, "\n".join(lines), reply_markup=kb)
-
-
-@bot.message_handler(
-    func=lambda m: m.text is not None
-    and re.fullmatch(r"\d+", (m.text or "").strip() or "")
-    and _sess_state(m, "vocab_quiz")
-)
-def on_vocab_quiz_answer(message: types.Message) -> None:
-    uid = _user_id(message)
-    if uid is None:
-        return
-    text = message.text
-    if text is None:
-        return
-    ctx = db.session_context(uid)
-    qs = ctx.get("questions") or []
-    idx = int(ctx.get("idx") or 0)
-    corr = int(ctx.get("correct") or 0)
-    restore = ctx.get("restore") or {}
-    choice = int(text.strip())
-    q = qs[idx] if idx < len(qs) else None
-    if not q:
+    if message.text.strip() == BTN_BACK:
         db.clear_session(uid)
+        bot.send_message(message.chat.id, "Bekor qilindi.", reply_markup=main_menu_markup(uid))
         return
-    if choice == int(q.get("correct", -1)):
-        corr += 1
-    expl = q.get("explain_uz") or ""
-    idx += 1
-    if expl:
-        bot.send_message(message.chat.id, expl)
-    if idx >= len(qs):
-        db.record_daily_activity(uid, met_goal=True)
-        restored = restore if isinstance(restore, dict) else {}
-        db.set_session(uid, "idle", restored)
+
+    code = message.text.strip().upper()
+    group = db.get_group_by_code(code)
+
+    if not group:
         bot.send_message(
             message.chat.id,
-            f"Vocab quiz tugadi: {corr}/{len(qs)}.",
-            reply_markup=main_menu_markup(uid),
+            "❌ Bunday kodli guruh topilmadi. Qayta urinib ko'ring:",
         )
         return
-    db.set_session(
-        uid,
-        "vocab_quiz",
-        {"questions": qs, "idx": idx, "correct": corr, "restore": restore},
-    )
-    _send_vocab_q(message.chat.id, qs[idx], idx, len(qs))
 
+    # Guruhga qo'shish
+    db.set_group_id(uid, group["id"])
+    db.set_teacher_id(uid, group["teacher_id"])
+    db.clear_session(uid)
 
-@bot.message_handler(func=lambda m: m.text == BTN_PARAPHRASE)
-def on_paraphrase_start(message: types.Message) -> None:
-    uid = _user_id(message)
-    if uid is None:
-        return
-    ctx = db.session_context(uid)
-    kws = (ctx.get("vocab") or {}).get("keywords") or []
-    sent = "Technology has changed the way children learn in schools."
-    if kws:
-        sent = f"Students should practice using words like: {', '.join(kws[:4])}."
-    db.set_session(uid, "paraphrase_wait", {"original": sent})
+    teacher = db.get_user_row(group["teacher_id"])
+    teacher_name = teacher["first_name"] if teacher and teacher["first_name"] else "O'qituvchi"
+
     bot.send_message(
         message.chat.id,
-        f"Quyidagi gapni o'zingizcha qayta yozing (Inglizcha):\n\n{sent}",
+        f"✅ Guruhga qo'shildingiz!\n\n"
+        f"📌 Guruh: <b>{group['name']}</b>\n"
+        f"👨‍🏫 O'qituvchi: <b>{teacher_name}</b>",
+        parse_mode="HTML",
         reply_markup=main_menu_markup(uid),
     )
 
 
 @bot.message_handler(
-    func=lambda m: m.content_type == "text"
-    and _sess_state(m, "paraphrase_wait")
-    and bool(m.text)
-    and (m.text not in _ALL_MENU_BUTTONS)
-    and not _starts_writing(m.text or "")
-    and not re.fullmatch(r"\d+", (m.text or "").strip())
+    func=lambda m: m.text == BTN_BACK and _sess_state(m, "await_group_code")
 )
-def on_paraphrase_reply(message: types.Message) -> None:
+def on_group_code_back(message: types.Message) -> None:
+    """Guruh kodini bekor qilish."""
     uid = _user_id(message)
     if uid is None:
         return
-    reply = message.text
-    if reply is None:
-        return
-    ctx = db.session_context(uid)
-    orig = ctx.get("original", "")
-    res = ask_text_safe(prompts.paraphrase_judge_prompt(orig, reply), timeout=60)
     db.clear_session(uid)
-    db.record_daily_activity(uid, met_goal=True)
-    bot.reply_to(message, res)
-    bot.send_message(message.chat.id, "Menyu:", reply_markup=main_menu_markup(uid))
-
-
-@bot.message_handler(func=lambda m: m.text == BTN_UPGRADE)
-def on_upgrade_word(message: types.Message) -> None:
-    uid = _user_id(message)
-    if uid is None:
-        return
-    ctx = db.session_context(uid)
-    kws = (ctx.get("vocab") or {}).get("keywords") or []
-    word = (kws[0] if kws else "important")
-    sent = f"The graph shows an important trend over time."
-    res = ask_text_safe(prompts.upgrade_word_prompt(word, sent), timeout=60)
-    db.record_daily_activity(uid, met_goal=True)
-    bot.send_message(message.chat.id, res, reply_markup=main_menu_markup(uid))
-
-
-@bot.message_handler(func=lambda m: m.text == BTN_HELP)
-def on_writing_help(message: types.Message) -> None:
-    _send_demo_cta(message.chat.id)
+    bot.send_message(message.chat.id, "Bekor qilindi.", reply_markup=main_menu_markup(uid))
 
 
 def _fallback_allowed(message: types.Message) -> bool:
@@ -898,46 +950,29 @@ def _fallback_allowed(message: types.Message) -> bool:
     t = message.text
     blocked = {
         BTN_TUTOR,
-        BTN_SPEAKING,
-        BTN_TEST,
-        BTN_STREAK,
         BTN_DIRECTION,
-        BTN_DASH,
-        BTN_SAMPLES,
-        BTN_ERRORS,
         BTN_TEACHER,
-        BTN_CHALLENGE,
         BTN_VOCAB,
         BTN_PARAPHRASE,
-        BTN_UPGRADE,
-        BTN_HELP,
         IELTS_START,
         CEFR_START,
-        "🔙 Orqaga",
-        "🎙 Task 1 maslahat",
-        "🎙 Task 2 maslahat",
+        BTN_BACK,
+        BTN_BALANCE,
+        BTN_UPGRADE_COINS,
+        BTN_GROUP_REPORT,
+        BTN_PROFILE,
+        BTN_CREATE_GROUP,
+        BTN_MY_GROUPS,
     }
     if t in blocked or t in TASK_BTN:
         return False
     if _starts_writing(t):
         return False
-    if t in ("📊 Task 1", "📝 Task 2", "✉️ Letter"):
-        return False
     uid = _user_id(message)
     if uid is None:
         return False
     sess = db.get_session(uid)
-    if sess and sess["state"] in (
-        "grammar_quiz",
-        "vocab_quiz",
-        "mini_challenge",
-        "await_teacher_id",
-        "paraphrase_wait",
-        "speaking_coach",
-        "speaking_pick",
-        "waiting_writing",
-        "pick_task",
-    ):
+    if sess and sess["state"] in _blocked_states():
         return False
     return True
 
@@ -947,6 +982,8 @@ def on_fallback_text(message: types.Message) -> None:
     uid = _user_id(message)
     if uid is None:
         return
+    if not _check_channel_or_block(uid, message.chat.id):
+        return
     q = message.text
     if not q:
         return
@@ -955,6 +992,843 @@ def on_fallback_text(message: types.Message) -> None:
     bot.send_chat_action(message.chat.id, "typing")
     res = ask_text_safe(f"Ingliz tili o'qituvchisi sifatida ({mode} kontekstida) javob ber: {q}")
     bot.reply_to(message, res)
+
+
+# =============================================================================
+# YANGI HANDLERLAR: Tanga, Vocabulary, Paraphrase, Guruh Hisoboti
+# =============================================================================
+
+@bot.message_handler(func=lambda m: m.text == BTN_BALANCE)
+def on_balance(message: types.Message) -> None:
+    uid = _user_id(message)
+    if uid is None:
+        return
+    if not _check_channel_or_block(uid, message.chat.id):
+        return
+    coins = db.get_coins(uid)
+    row = db.get_user_row(uid)
+    role = row["role"] if row else "STUDENT"
+    tariff = row["tariff"] if row else "FREE"
+    writing_today = db.get_daily_writing_count(uid)
+    paraphrase_today = db.get_daily_paraphrase_count(uid)
+    combo = row["combo_streak"] if row else 0
+    free = row["free_spins"] if row else 0
+
+    # O'qituvchi uchun qo'shimcha ma'lumot
+    extra_msg = ""
+    if role == "TEACHER":
+        groups = db.get_teacher_groups(uid)
+        if groups:
+            total_students = 0
+            for g in groups:
+                students = db.get_group_students(g["id"])
+                total_students += len(students)
+            extra_msg = f"\n\n👨‍🏫 *Guruhlar*: {len(groups)} ta\n" \
+                        f"👥 *Jami o'quvchilar*: {total_students} ta"
+
+    msg = (
+        f"💰 *Tanga hisobingiz*: `{coins:.1f}`\n\n"
+        f"🎫 *Tarif*: {tariff}\n"
+        f"{extra_msg}\n"
+        f"📊 *Bugungi limitlar*:\n"
+        f"• Writing tahlili: {writing_today}/{config.WRITING_DAILY_FREE} (bepul)\n"
+        f"• Paraphrase o'yini: {paraphrase_today}/{config.PARAPHRASE_DAILY_FREE} (bepul)\n\n"
+        f"🔥 *Combo*: {combo} ketma-ket\n"
+        f"🎰 *Tekin barabanlar*: {free}\n\n"
+        f"💵 *Narxlar*:\n"
+        f"• Writing tahlili: {config.WRITING_ANALYSIS_COST} tanga (bepul limitdan keyin)\n"
+        f"• Vocabulary: {config.VOCAB_COST} tanga\n"
+        f"• Paraphrase: {config.PARAPHRASE_COST} tanga"
+    )
+    bot.send_message(message.chat.id, msg, parse_mode="Markdown")
+
+
+@bot.message_handler(func=lambda m: m.text == BTN_UPGRADE_COINS)
+def on_topup(message: types.Message) -> None:
+    uid = _user_id(message)
+    if uid is None:
+        return
+    markup = types.InlineKeyboardMarkup()
+    # Bu yerda to'lov havolasi bo'ladi
+    markup.add(types.InlineKeyboardButton("💳 To'lov sahifasi (tez orada)", url="https://t.me/thisisaliyev"))
+    bot.send_message(
+        message.chat.id,
+        "Tanga to'ldirish uchun pastdagi tugmani bosing yoki admin bilan bog'laning.\n\n"
+        "💰 *1000 tanga = 10,000 so'm*",
+        parse_mode="Markdown",
+        reply_markup=markup,
+    )
+
+
+# =============================================================================
+# O'QITUVCHI: GURUH YARATISH
+# =============================================================================
+
+def on_create_group_menu(message: types.Message) -> None:
+    """O'qituvchi uchun guruh yaratish menyusi."""
+    uid = _user_id(message)
+    if uid is None:
+        return
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.add(BTN_CREATE_GROUP, BTN_MY_GROUPS)
+    kb.add(BTN_BACK)
+    db.set_session(uid, "group_menu_idle", {})
+    bot.send_message(
+        message.chat.id,
+        "👨‍🏫 <b>Guruhlar boshqaruvi</b>\n\n"
+        "➕ Yangi guruh yaratish yoki\n"
+        "📋 Mavjud guruh'laringizni ko'rish:",
+        parse_mode="HTML",
+        reply_markup=kb,
+    )
+
+
+@bot.message_handler(func=lambda m: m.text == BTN_CREATE_GROUP)
+def on_create_group(message: types.Message) -> None:
+    """Guruh yaratishni boshlash."""
+    uid = _user_id(message)
+    if uid is None:
+        return
+    row = db.get_user_row(uid)
+    role = row["role"] if row else "STUDENT"
+    if role != "TEACHER":
+        bot.send_message(
+            message.chat.id,
+            "❌ Bu funksiya faqat o'qituvchilar uchun.",
+            reply_markup=main_menu_markup(uid),
+        )
+        return
+    db.set_session(uid, "await_create_group_name", {})
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.add(BTN_BACK)
+    bot.send_message(
+        message.chat.id,
+        "➕ <b>Yangi guruh yaratish</b>\n\n"
+        "Guruh nomini kiriting:\n"
+        "(Masalan: IELTS Advanced A1)",
+        parse_mode="HTML",
+        reply_markup=kb,
+    )
+
+
+@bot.message_handler(
+    func=lambda m: m.content_type == "text" and _sess_state(m, "await_create_group_name")
+)
+def on_group_name_submit(message: types.Message) -> None:
+    """O'qituvchi guruh nomini kiritganda."""
+    uid = _user_id(message)
+    if uid is None:
+        return
+    if not message.text:
+        return
+    if message.text.strip() == BTN_BACK:
+        db.clear_session(uid)
+        bot.send_message(message.chat.id, "Bekor qilindi.", reply_markup=teacher_menu_markup(uid))
+        return
+
+    name = message.text.strip()
+    if len(name) < 2:
+        bot.send_message(message.chat.id, "❌ Guruh nomi kamida 2 ta harf bo'lishi kerak:")
+        return
+
+    # Guruh yaratish
+    group = db.create_group(name, uid)
+
+    db.clear_session(uid)
+    bot.send_message(
+        message.chat.id,
+        f"✅ Guruh muvaffaqiyatli yaratildi!\n\n"
+        f"📌 Guruh: <b>{group['name']}</b>\n"
+        f"🔑 Qo'shilish kodi: <code>{group['join_code']}</code>\n\n"
+        f"Bu kodni o'quvchilaringizga yuboring. Ular shu kod orqali guruhga qo'shilishadi.",
+        parse_mode="HTML",
+        reply_markup=teacher_menu_markup(uid),
+    )
+
+
+@bot.message_handler(func=lambda m: m.text == BTN_MY_GROUPS)
+def on_my_groups(message: types.Message) -> None:
+    """O'qituvchining guruhlarini ko'rsatish."""
+    uid = _user_id(message)
+    if uid is None:
+        return
+    groups = db.get_teacher_groups(uid)
+    if not groups:
+        bot.send_message(
+            message.chat.id,
+            "📋 Sizda hali guruhlar yo'q.\n\n"
+            "➕ Yangi guruh yaratish uchun pastdagi tugmani bosing:",
+            reply_markup=teacher_menu_markup(uid),
+        )
+        return
+
+    text = "📋 <b>Mening guruhlarim:</b>\n\n"
+    for g in groups:
+        students = db.get_group_students(g["id"])
+        text += (
+            f"📌 <b>{g['name']}</b>\n"
+            f"🔑 Kod: <code>{g['join_code']}</code>\n"
+            f"👥 O'quvchilar: {len(students)} ta\n\n"
+        )
+
+    bot.send_message(message.chat.id, text, parse_mode="HTML", reply_markup=teacher_menu_markup(uid))
+
+
+# ── Profil ────────────────────────────────────────────────────────────────
+
+@bot.message_handler(func=lambda m: m.text == BTN_PROFILE)
+def on_profile(message: types.Message) -> None:
+    uid = _user_id(message)
+    if uid is None:
+        logger.warning("Profile: uid is None")
+        return
+    row = db.get_user_row(uid)
+    if not row:
+        logger.warning("Profile: user not found for uid=%d", uid)
+        bot.send_message(message.chat.id, "⚠️ Foydalanuvchi topilmadi. /start ni bosing.")
+        return
+
+    fn = row["first_name"] or "—"
+    ln = row["last_name"] or "—"
+    phone = row["phone"] or "—"
+    tg_username = row["telegram_username"] or "—"
+    mode = row["mode"] or "IELTS"
+    tariff = row["tariff"] or "FREE"
+    coins = row["coins"] if row["coins"] is not None else 0
+    role = row["role"] if row else "STUDENT"
+
+    # O'quvchi uchun: guruh va o'qituvchi ma'lumotlari
+    extra_info = ""
+    if role == "STUDENT":
+        # Guruh ma'lumotlari
+        user_dict = dict(row)
+        group_id = user_dict.get("group_id")
+        if group_id:
+            group = db.get_group_by_id(group_id)
+            if group:
+                extra_info += f"\n🏫 Guruh: <b>{group['name']}</b>"
+                # O'qituvchi ismi
+                teacher = db.get_user_row(group["teacher_id"])
+                if teacher:
+                    teacher_name = teacher["first_name"] or "O'qituvchi"
+                    teacher_last = teacher["last_name"] or ""
+                    full_teacher = f"{teacher_name} {teacher_last}".strip()
+                    extra_info += f"\n👨‍🏫 O'qituvchi: <b>{full_teacher}</b>"
+        else:
+            extra_info += "\n🏫 Guruh: <i>Hali guruhga qo'shilmagansiz</i>"
+
+    text = (
+        f"👤 <b>PROFILINGIZ</b>\n\n"
+        f"👤 Ism: <b>{fn}</b>\n"
+        f"👤 Familiya: <b>{ln}</b>\n"
+        f"📱 Telefon: <code>{phone}</code>\n"
+        f"🔗 Telegram username: @{tg_username}\n\n"
+        f"🎫 Tarif: {tariff}\n"
+        f"💰 Tanga: {coins:.0f}\n"
+        f"📚 Rejim: {mode}"
+        f"{extra_info}"
+        f"\n\n✏️ <b>Tahrirlash:</b>\n"
+        f"/edit_name — Ism o'zgartirish\n"
+        f"/edit_lastname — Familiya o'zgartirish\n"
+        f"/edit_phone — Telefon o'zgartirish"
+    )
+    logger.info("Profile shown for uid=%d", uid)
+    bot.send_message(message.chat.id, text, parse_mode="HTML")
+
+
+@bot.message_handler(commands=["edit_name"])
+def on_edit_firstname(message: types.Message) -> None:
+    uid = _user_id(message)
+    if uid is None:
+        return
+    if not db.is_registered(uid):
+        bot.send_message(message.chat.id, "⚠️ Avval ro'yxatdan o'ting. /start ni bosing.")
+        return
+    db.set_session(uid, "profile_edit_firstname", {})
+    bot.send_message(message.chat.id, "✏️ Yangi ismingizni kiriting:")
+
+
+@bot.message_handler(func=lambda m: _sess_state(m, "profile_edit_firstname"))
+def on_profile_edit_firstname(message: types.Message) -> None:
+    uid = _user_id(message)
+    if uid is None or not message.text:
+        return
+    new_name = message.text.strip()
+    if not new_name or len(new_name) < 2:
+        bot.send_message(message.chat.id, "❌ Ism kamida 2 ta harf bo'lishi kerak:")
+        return
+    db.update_user_profile(uid, first_name=new_name)
+    db.clear_session(uid)
+    bot.send_message(
+        message.chat.id,
+        f"✅ Ismingiz o'zgartirildi: <b>{new_name}</b>",
+        parse_mode="HTML",
+        reply_markup=main_menu_markup(uid),
+    )
+
+
+@bot.message_handler(commands=["edit_lastname"])
+def on_edit_lastname(message: types.Message) -> None:
+    uid = _user_id(message)
+    if uid is None:
+        return
+    if not db.is_registered(uid):
+        bot.send_message(message.chat.id, "⚠️ Avval ro'yxatdan o'ting. /start ni bosing.")
+        return
+    db.set_session(uid, "profile_edit_lastname", {})
+    bot.send_message(message.chat.id, "✏️ Yangi familiyangizni kiriting:")
+
+
+@bot.message_handler(func=lambda m: _sess_state(m, "profile_edit_lastname"))
+def on_profile_edit_lastname(message: types.Message) -> None:
+    uid = _user_id(message)
+    if uid is None or not message.text:
+        return
+    new_lastname = message.text.strip()
+    if not new_lastname or len(new_lastname) < 2:
+        bot.send_message(message.chat.id, "❌ Familiya kamida 2 ta harf bo'lishi kerak:")
+        return
+    db.update_user_profile(uid, last_name=new_lastname)
+    db.clear_session(uid)
+    bot.send_message(
+        message.chat.id,
+        f"✅ Familiyangiz o'zgartirildi: <b>{new_lastname}</b>",
+        parse_mode="HTML",
+        reply_markup=main_menu_markup(uid),
+    )
+
+
+@bot.message_handler(commands=["edit_phone"])
+def on_edit_phone(message: types.Message) -> None:
+    uid = _user_id(message)
+    if uid is None:
+        return
+    if not db.is_registered(uid):
+        bot.send_message(message.chat.id, "⚠️ Avval ro'yxatdan o'ting. /start ni bosing.")
+        return
+    # Contact share tugmasi
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.add(types.KeyboardButton("📱 Telefon raqamni yuborish", request_contact=True))
+    kb.add(BTN_BACK)
+    db.set_session(uid, "profile_edit_phone", {})
+    bot.send_message(
+        message.chat.id,
+        "✏️ Yangi telefon raqamingizni yuboring:",
+        reply_markup=kb,
+    )
+
+
+@bot.message_handler(content_types=["contact"], func=lambda m: _sess_state(m, "profile_edit_phone"))
+def on_profile_edit_phone_contact(message: types.Message) -> None:
+    uid = _user_id(message)
+    if uid is None:
+        return
+    contact = message.contact
+    if not contact:
+        bot.send_message(message.chat.id, "❌ Iltimos, telefon raqamingizni yuboring:")
+        return
+    phone = contact.phone_number
+    db.update_user_profile(uid, phone=phone)
+    db.clear_session(uid)
+    bot.send_message(
+        message.chat.id,
+        f"✅ Telefon raqamingiz o'zgartirildi: <code>{phone}</code>",
+        parse_mode="HTML",
+        reply_markup=main_menu_markup(uid),
+    )
+
+
+@bot.message_handler(
+    func=lambda m: m.content_type == "text" and _sess_state(m, "profile_edit_phone")
+)
+def on_profile_edit_phone_text(message: types.Message) -> None:
+    """Agar foydalanuvchi contact share qilmasa, matn kiritishga ruxsat."""
+    uid = _user_id(message)
+    if uid is None or not message.text:
+        return
+    if message.text.strip() == BTN_BACK:
+        db.clear_session(uid)
+        bot.send_message(message.chat.id, "Bekor qilindi.", reply_markup=main_menu_markup(uid))
+        return
+    phone = message.text.strip()
+    if not phone or len(phone) < 7:
+        bot.send_message(message.chat.id, "❌ Iltimos, to'g'ri telefon raqam kiriting:")
+        return
+    db.update_user_profile(uid, phone=phone)
+    db.clear_session(uid)
+    bot.send_message(
+        message.chat.id,
+        f"✅ Telefon raqamingiz o'zgartirildi: <code>{phone}</code>",
+        parse_mode="HTML",
+        reply_markup=main_menu_markup(uid),
+    )
+
+
+# ── Paraphrase o'yini ──────────────────────────────────────────────────────
+
+@bot.message_handler(func=lambda m: m.text == BTN_PARAPHRASE)
+def on_paraphrase_menu(message: types.Message) -> None:
+    uid = _user_id(message)
+    if uid is None:
+        return
+    if not _check_channel_or_block(uid, message.chat.id):
+        return
+    db.ensure_user(uid)
+    db.reset_daily_limits_if_needed(uid)
+
+    paraphrase_count = db.get_daily_paraphrase_count(uid)
+    row = db.get_user_row(uid)
+    free_spins = row["free_spins"] if row else 0
+    combo = row["combo_streak"] if row else 0
+
+    # Agar bepul limitdan oshgan bo'lsa, to'lash kerak
+    if paraphrase_count >= config.PARAPHRASE_DAILY_FREE:
+        cost = config.PARAPHRASE_COST
+        if free_spins > 0:
+            # Tekin baraban bor
+            markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+            markup.add("🎰 Tekin baraban ishlatish", BTN_BACK)
+            bot.send_message(
+                message.chat.id,
+                f"🎰 Sizda {free_spins} ta tekin baraban bor!\n\n"
+                f"Combo: {combo}\n\n"
+                f"Yoki {cost} tanga to'lab davom eting.",
+                reply_markup=markup,
+            )
+            db.set_session(uid, "paraphrase_payment_pick", {})
+            return
+        # To'lash kerak
+        if not db.check_coins(uid, cost):
+            bot.send_message(
+                message.chat.id,
+                f"❌ Kechirasiz, bugungi bepul limit ({config.PARAPHRASE_DAILY_FREE} ta) tugagan.\n\n"
+                f"💰 Paraphrase narxi: {cost} tanga\n"
+                f"📊 Sizning balansingiz: {db.get_coins(uid):.1f} tanga\n\n"
+                f"Iltimos, hisobni to'ldiring.",
+                reply_markup=main_menu_markup(uid),
+            )
+            return
+
+    # Paraphrase uchun jumla so'rash — chiqish tugmasi bilan
+    db.set_session(uid, "await_paraphrase", {})
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=1)
+    kb.add(BTN_EXIT_GAME)
+    bot.send_message(
+        message.chat.id,
+        "🔁 *Paraphrase o'yini*\n\n"
+        "Men sizga inglizcha jumla beraman. Siz uni o'z so'zlaringiz bilan qayta yozing.\n\n"
+        f"🎯 Narx: {config.PARAPHRASE_COST} tanga (bepul limitdan keyin)\n"
+        f"🔥 Combo: {combo} ketma-ket\n"
+        f"🎰 Tekin barabanlar: {free_spins}\n\n"
+        f"Bugungi: {paraphrase_count}/{config.PARAPHRASE_DAILY_FREE} (bepul)\n\n"
+        "Paraphrase qilmoqchi bo'lgan jumlani yozing:",
+        parse_mode="Markdown",
+        reply_markup=kb,
+    )
+
+
+@bot.message_handler(func=lambda m: m.text == "🎰 Tekin baraban ishlatish" and _sess_state(m, "paraphrase_payment_pick"))
+def on_free_spin_use(message: types.Message) -> None:
+    uid = _user_id(message)
+    if uid is None:
+        return
+    if db.use_free_spin(uid):
+        db.set_session(uid, "await_paraphrase", {})
+        bot.send_message(
+            message.chat.id,
+            "🎰 Tekin baraban ishlatildi! Paraphrase qilmoqchi bo'lgan jumlani yozing:",
+            reply_markup=main_menu_markup(uid),
+        )
+    else:
+        bot.send_message(
+            message.chat.id,
+            "❌ Kechirasiz, tekin barabanlar tugagan.",
+            reply_markup=main_menu_markup(uid),
+        )
+
+
+@bot.message_handler(func=lambda m: m.text == BTN_EXIT_GAME and _sess_state(m, "await_paraphrase"))
+def on_paraphrase_exit(message: types.Message) -> None:
+    """O'yindan chiqish."""
+    uid = _user_id(message)
+    if uid is None:
+        return
+    db.clear_session(uid)
+    bot.send_message(
+        message.chat.id,
+        "🚪 O'yindan chiqdingiz.",
+        reply_markup=main_menu_markup(uid),
+    )
+
+
+@bot.message_handler(
+    func=lambda m: m.content_type == "text"
+    and _sess_state(m, "await_paraphrase")
+    and m.text not in _ALL_MENU_BUTTONS
+)
+def on_paraphrase_submit(message: types.Message) -> None:
+    uid = _user_id(message)
+    if uid is None:
+        return
+    user_rewrite = message.text.strip()
+    if not user_rewrite:
+        return
+
+    # Agar bu foydalanuvchi kiritgan jumla bo'lsa (o'yin boshlanishi)
+    ctx = db.session_context(uid)
+    original = ctx.get("original_sentence")
+
+    if not original:
+        # Bu foydalanuvchi kiritgan asl jumla — AI dan paraphrase so'rash
+        db.update_session_context(uid, original_sentence=user_rewrite)
+        # Chiqish tugmasini qayta ko'rsatish
+        kb = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=1)
+        kb.add(BTN_EXIT_GAME)
+        bot.send_message(
+            message.chat.id,
+            "✅ Endi shu jumlani paraphrase qiling (o'z so'zlaringiz bilan qayta yozing):",
+            reply_markup=kb,
+        )
+        return
+
+    # Foydalanuvchi paraphrase qildi — baholash
+    paraphrase_count = db.get_daily_paraphrase_count(uid)
+    row = db.get_user_row(uid)
+    free_spins = row["free_spins"] if row else 0
+
+    # To'lov tekshiruvi
+    if paraphrase_count >= config.PARAPHRASE_DAILY_FREE:
+        if free_spins > 0:
+            db.use_free_spin(uid)
+        else:
+            cost = config.PARAPHRASE_COST
+            ok, balance = db.deduct_coins(uid, cost, "paraphrase")
+            if not ok:
+                bot.send_message(
+                    message.chat.id,
+                    f"❌ Yetarli tanga yo'q. Kerak: {cost} tanga, balans: {balance:.1f}",
+                    reply_markup=main_menu_markup(uid),
+                )
+                db.clear_session(uid)
+                return
+
+    # Baholash
+    sys_prompt = prompts.paraphrase_judge_detailed_prompt(original, user_rewrite)
+    raw = ask_text_safe(sys_prompt, timeout=90)
+    data = extract_json_blob(raw)
+
+    # Natijani formatlash
+    score = (data or {}).get("score", 0)
+    verdict = (data or {}).get("verdict", "average")
+    positive = (data or {}).get("positive", "")
+    needs_improvement = (data or {}).get("needs_improvement", "")
+    ideal = (data or {}).get("ideal_variant", "")
+
+    verdict_emoji = {
+        "good": "✅ Yaxshi",
+        "average": "🟡 O'rtacha",
+        "weak": "❌ Zaif",
+    }.get(verdict, "🟡 O'rtacha")
+
+    # Combo yangilash
+    meaning_preserved = (data or {}).get("meaning_preserved", False)
+    streak_broken = score < 7
+
+    if streak_broken:
+        # Combo buzildi — 0 ga tushadi
+        db.reset_combo_streak(uid)
+        new_combo = 0
+        reward = 0.0
+        combo_msg = "\n💔 Combo buzildi! Combo 0 ga tushdi."
+    else:
+        # Combo davom etadi
+        _, earned_spin = db.update_combo_streak(uid, increment=True)
+        row_after = db.get_user_row(uid)
+        new_combo = int(row_after["combo_streak"]) if row_after and row_after["combo_streak"] is not None else 0
+        earned_spin = int(row_after["free_spins"]) if row_after and row_after["free_spins"] is not None else 0
+        # Tanga mukofoti
+        reward = db.get_paraphrase_reward(new_combo)
+        if reward > 0:
+            db.add_coins(uid, reward, "paraphrase_reward")
+            combo_msg = f"\n💰 +{reward:.1f} tanga mukofot!"
+        else:
+            combo_msg = ""
+        if earned_spin > 0:
+            combo_msg += f"\n🎉 +{earned_spin} ta tekin baraban qozonildi!"
+
+    spin_msg = ""
+    row_final = db.get_user_row(uid)
+    free_final = int(row_final["free_spins"]) if row_final and row_final["free_spins"] is not None else 0
+    if free_final > 0:
+        spin_msg = f"\n🎰 Tekin barabanlar: {free_final}"
+
+    result_text = (
+        f"🎮 *PARAPHRASE NATIJASI*\n\n"
+        f"Asl jumla: \"{original}\"\n"
+        f"Sizning variant: \"{user_rewrite}\"\n\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"Ball: {score} / 10\n"
+        f"━━━━━━━━━━━━━━━\n\n"
+        f"{verdict_emoji}\n\n"
+        f"📝 Izoh:\n"
+        f"• {positive}\n"
+        f"• {needs_improvement}\n\n"
+        f"💡 Ideal variant: \"{ideal}\"\n\n"
+        f"🔥 Combo: {new_combo} ketma-ket"
+        f"{combo_msg}"
+        f"{spin_msg}"
+    )
+
+    db.increment_daily_paraphrase(uid)
+    # Keyingi savol uchun sessiyani saqlab qolish, chiqish tugmasini ko'rsatish
+    db.set_session(uid, "await_paraphrase", {"original_sentence": original})
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=1)
+    kb.add(BTN_EXIT_GAME)
+    bot.send_message(
+        message.chat.id,
+        result_text,
+        parse_mode="Markdown",
+        reply_markup=kb,
+    )
+
+
+# ── Vocabulary Booster ────────────────────────────────────────────────────
+
+@bot.message_handler(func=lambda m: m.text == BTN_VOCAB)
+def on_vocab_request(message: types.Message) -> None:
+    uid = _user_id(message)
+    if uid is None:
+        return
+    if not _check_channel_or_block(uid, message.chat.id):
+        return
+    db.ensure_user(uid)
+
+    # Agar vocab session bo'lsa, o'shandan foydalan
+    ctx = db.session_context(uid)
+    vocab_ctx = ctx.get("vocab") or {}
+
+    if vocab_ctx and vocab_ctx.get("topic"):
+        topic = vocab_ctx["topic"]
+        keywords = vocab_ctx.get("keywords", [])
+        collocations = vocab_ctx.get("collocations", [])
+
+        # Narx tekshiruvi
+        if not db.check_coins(uid, config.VOCAB_COST):
+            bot.send_message(
+                message.chat.id,
+                f"❌ Yetarli tanga yo'q.\n\n"
+                f"💰 Vocabulary narxi: {config.VOCAB_COST} tanga\n"
+                f"📊 Balans: {db.get_coins(uid):.1f} tanga",
+                reply_markup=main_menu_markup(uid),
+            )
+            return
+
+        # To'lov
+        ok, balance = db.deduct_coins(uid, config.VOCAB_COST, "vocabulary")
+        if not ok:
+            bot.send_message(
+                message.chat.id,
+                f"❌ Yetarli tanga yo'q. Kerak: {config.VOCAB_COST} tanga, balans: {balance:.1f}",
+                reply_markup=main_menu_markup(uid),
+            )
+            return
+
+        # Tahlil
+        sys_prompt = prompts.vocabulary_detailed_prompt(topic, keywords, collocations)
+        raw = ask_text_safe(sys_prompt, timeout=90)
+        feedback = raw.rsplit("{", 1)[0].strip() if "{" in raw else raw
+
+        bot.send_message(message.chat.id, feedback, reply_markup=main_menu_markup(uid))
+        return
+
+    # Vocabulary mavzu so'rash
+    db.set_session(uid, "await_vocab_topic", {})
+    bot.send_message(
+        message.chat.id,
+        f"📚 *Vocabulary Booster*\n\n"
+        f"Qaysi mavzuda so'zlar o'rganmoqchisiz?\n\n"
+        f"Misol: education, environment, technology, health, travel...\n\n"
+        f"💰 Narx: {config.VOCAB_COST} tanga",
+        parse_mode="Markdown",
+    )
+
+
+@bot.message_handler(
+    func=lambda m: m.content_type == "text"
+    and _sess_state(m, "await_vocab_topic")
+    and m.text not in _ALL_MENU_BUTTONS
+)
+def on_vocab_topic_submit(message: types.Message) -> None:
+    uid = _user_id(message)
+    if uid is None:
+        return
+    topic = message.text.strip()
+    if not topic or topic == BTN_BACK:
+        db.clear_session(uid)
+        bot.send_message(message.chat.id, "Bekor qilindi.", reply_markup=main_menu_markup(uid))
+        return
+
+    # Narx tekshiruvi
+    if not db.check_coins(uid, config.VOCAB_COST):
+        bot.send_message(
+            message.chat.id,
+            f"❌ Yetarli tanga yo'q.\n\n"
+            f"💰 Vocabulary narxi: {config.VOCAB_COST} tanga\n"
+            f"📊 Balans: {db.get_coins(uid):.1f} tanga\n\n"
+            f"Boshqa mavzu kiriting yoki bekor qiling.",
+        )
+        return
+
+    # To'lov
+    ok, balance = db.deduct_coins(uid, config.VOCAB_COST, "vocabulary")
+    if not ok:
+        bot.send_message(
+            message.chat.id,
+            f"❌ Yetarli tanga yo'q. Kerak: {config.VOCAB_COST} tanga, balans: {balance:.1f}",
+            reply_markup=main_menu_markup(uid),
+        )
+        db.clear_session(uid)
+        return
+
+    # AI dan vocabulary so'rash
+    sys_prompt = prompts.vocabulary_detailed_prompt(topic, [], [])
+    bot.send_chat_action(message.chat.id, "typing")
+    raw = ask_text_safe(sys_prompt, timeout=90)
+    feedback = raw.rsplit("{", 1)[0].strip() if "{" in raw else raw
+
+    db.clear_session(uid)
+    bot.send_message(
+        message.chat.id,
+        feedback,
+        reply_markup=main_menu_markup(uid),
+    )
+
+
+# ── O'qituvchi: Guruh Hisoboti ─────────────────────────────────────────────
+
+@bot.message_handler(func=lambda m: m.text == BTN_GROUP_REPORT)
+def on_group_report(message: types.Message) -> None:
+    uid = _user_id(message)
+    if uid is None:
+        return
+    row = db.get_user_row(uid)
+    role = row["role"] if row else "STUDENT"
+
+    if role != "TEACHER":
+        bot.send_message(
+            message.chat.id,
+            "❌ Bu funksiya faqat o'qituvchilar uchun.",
+            reply_markup=main_menu_markup(uid),
+        )
+        return
+
+    # O'qituvchining o'quvchilarini olish
+    with db.get_conn() as conn:
+        cur = conn.execute(
+            """SELECT u.user_id, u.mode, u.coins, u.tariff,
+                      ws.overall_band, ws.cefr_level, ws.created_at, ws.task_type
+               FROM users u
+               LEFT JOIN writing_submissions ws ON u.user_id = ws.user_id
+               WHERE u.teacher_id = ?
+               ORDER BY ws.created_at DESC""",
+            (uid,),
+        )
+        students = cur.fetchall()
+
+    if not students:
+        bot.send_message(
+            message.chat.id,
+            "📊 Hali o'quvchilar yo'q yoki ular writing yuborishmagan.",
+            reply_markup=main_menu_markup(uid),
+        )
+        return
+
+    # Ma'lumotlarni formatlash
+    students_data = []
+    for s in students:
+        students_data.append({
+            "user_id": s["user_id"],
+            "mode": s["mode"],
+            "last_band": s["overall_band"],
+            "cefr": s["cefr_level"],
+            "last_activity": s["created_at"],
+            "task_type": s["task_type"],
+        })
+
+    # Period tanlash
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=1)
+    markup.add("📅 Bugun", "📅 Haftalik", "📅 Oylik", BTN_BACK)
+    db.set_session(uid, "group_report_period_pick", {})
+    bot.send_message(
+        message.chat.id,
+        "👥 *Guruh Hisoboti*\n\n"
+        f"O'quvchilar soni: {len(set(s['user_id'] for s in students))}\n"
+        f"Jami writing'lar: {len(students)}\n\n"
+        "Qaysi davr uchun hisobot kerak?",
+        parse_mode="Markdown",
+        reply_markup=markup,
+    )
+
+
+@bot.message_handler(
+    func=lambda m: m.text in ("📅 Bugun", "📅 Haftalik", "📅 Oylik", BTN_BACK)
+    and _sess_state(m, "group_report_period_pick")
+)
+def on_group_report_period(message: types.Message) -> None:
+    uid = _user_id(message)
+    if uid is None:
+        return
+    if message.text == BTN_BACK:
+        db.clear_session(uid)
+        bot.send_message(message.chat.id, "Bekor qilindi.", reply_markup=main_menu_markup(uid))
+        return
+
+    period_map = {"📅 Bugun": "bugungi", "📅 Haftalik": "haftalik", "📅 Oylik": "oylik"}
+    period = period_map.get(message.text, "haftalik")
+
+    # O'quvchilar ma'lumotlarini yig'ish
+    with db.get_conn() as conn:
+        cur = conn.execute(
+            """SELECT u.user_id,
+                      AVG(ws.overall_band) as avg_band,
+                      COUNT(ws.id) as writing_count
+               FROM users u
+               INNER JOIN writing_submissions ws ON u.user_id = ws.user_id
+               WHERE u.teacher_id = ?
+               GROUP BY u.user_id""",
+            (uid,),
+        )
+        student_stats = cur.fetchall()
+
+    if not student_stats:
+        bot.send_message(
+            message.chat.id,
+            "📊 Hali yetarli ma'lumot yo'q.",
+            reply_markup=main_menu_markup(uid),
+        )
+        db.clear_session(uid)
+        return
+
+    # Guruh tahlili prompti
+    students_data = []
+    for s in student_stats:
+        students_data.append({
+            "student_id": s["user_id"],
+            "avg_band": round(s["avg_band"], 1) if s["avg_band"] else None,
+            "writings": s["writing_count"],
+        })
+
+    sys_prompt = prompts.group_analysis_report_prompt(students_data, period)
+    bot.send_chat_action(message.chat.id, "typing")
+    raw = ask_text_safe(sys_prompt, timeout=120)
+    feedback = raw.rsplit("{", 1)[0].strip() if "{" in raw else raw
+
+    db.clear_session(uid)
+    bot.send_message(
+        message.chat.id,
+        feedback,
+        reply_markup=main_menu_markup(uid),
+    )
 
 
 def run_bot() -> None:

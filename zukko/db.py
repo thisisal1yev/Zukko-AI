@@ -8,17 +8,36 @@ from datetime import date, datetime, timedelta
 from typing import Any, Optional
 
 DB_PATH = "zukkotutor.db"
+_MAX_RETRIES = 3
 
 
 @contextmanager
-def get_conn():
-    conn = sqlite3.connect(DB_PATH, timeout=30)
-    conn.row_factory = sqlite3.Row
-    try:
-        yield conn
-        conn.commit()
-    finally:
-        conn.close()
+def get_conn(retry_count: int = 0):
+    import time
+    import logging
+    logger = logging.getLogger(__name__)
+    
+    for attempt in range(_MAX_RETRIES):
+        try:
+            conn = sqlite3.connect(DB_PATH, timeout=60)
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA busy_timeout=5000")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA cache_size=-64000")  # 64MB cache
+            conn.row_factory = sqlite3.Row
+            try:
+                yield conn
+                conn.commit()
+            finally:
+                conn.close()
+            return  # muvaffaqiyatli bo'lsa, chiqish
+        except sqlite3.OperationalError as e:
+            if "database is locked" in str(e).lower() and attempt < _MAX_RETRIES - 1:
+                wait_time = 0.5 * (attempt + 1)
+                logger.warning("DB locked, retry %d/%d after %.1fs", attempt + 1, _MAX_RETRIES, wait_time)
+                time.sleep(wait_time)
+            else:
+                raise
 
 
 def init_db() -> None:
@@ -37,7 +56,26 @@ def init_db() -> None:
                 teacher_id INTEGER,
                 link_code TEXT,
                 low_band_count INTEGER DEFAULT 0,
-                demo_offered INTEGER DEFAULT 0
+                demo_offered INTEGER DEFAULT 0,
+                role TEXT DEFAULT 'STUDENT',
+                coins REAL DEFAULT 0,
+                tariff TEXT DEFAULT 'FREE',
+                tariff_expires TEXT,
+                combo_streak INTEGER DEFAULT 0,
+                free_spins INTEGER DEFAULT 0,
+                daily_writing_count INTEGER DEFAULT 0,
+                daily_writing_date TEXT,
+                daily_paraphrase_count INTEGER DEFAULT 0,
+                daily_paraphrase_date TEXT
+            )"""
+        )
+        c.execute(
+            """CREATE TABLE IF NOT EXISTS groups (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                join_code TEXT NOT NULL UNIQUE,
+                teacher_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL
             )"""
         )
         c.execute(
@@ -95,6 +133,17 @@ def init_db() -> None:
                 detail_json TEXT
             )"""
         )
+        c.execute(
+            """CREATE TABLE IF NOT EXISTS transactions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                amount REAL NOT NULL,
+                service_type TEXT NOT NULL,
+                balance_after REAL NOT NULL,
+                detail_json TEXT
+            )"""
+        )
         _migrate_users_columns(conn)
 
 
@@ -121,6 +170,40 @@ def _migrate_users_columns(conn: sqlite3.Connection) -> None:
         alters.append("ALTER TABLE users ADD COLUMN demo_offered INTEGER DEFAULT 0")
     if "preferred_task" not in cols:
         alters.append("ALTER TABLE users ADD COLUMN preferred_task TEXT DEFAULT 'task2'")
+    if "role" not in cols:
+        alters.append("ALTER TABLE users ADD COLUMN role TEXT DEFAULT 'STUDENT'")
+    if "coins" not in cols:
+        alters.append("ALTER TABLE users ADD COLUMN coins REAL DEFAULT 0")
+    if "tariff" not in cols:
+        alters.append("ALTER TABLE users ADD COLUMN tariff TEXT DEFAULT 'FREE'")
+    if "tariff_expires" not in cols:
+        alters.append("ALTER TABLE users ADD COLUMN tariff_expires TEXT")
+    if "combo_streak" not in cols:
+        alters.append("ALTER TABLE users ADD COLUMN combo_streak INTEGER DEFAULT 0")
+    if "free_spins" not in cols:
+        alters.append("ALTER TABLE users ADD COLUMN free_spins INTEGER DEFAULT 0")
+    if "daily_writing_count" not in cols:
+        alters.append("ALTER TABLE users ADD COLUMN daily_writing_count INTEGER DEFAULT 0")
+    if "daily_writing_date" not in cols:
+        alters.append("ALTER TABLE users ADD COLUMN daily_writing_date TEXT")
+    if "daily_paraphrase_count" not in cols:
+        alters.append("ALTER TABLE users ADD COLUMN daily_paraphrase_count INTEGER DEFAULT 0")
+    if "daily_paraphrase_date" not in cols:
+        alters.append("ALTER TABLE users ADD COLUMN daily_paraphrase_date TEXT")
+    if "first_name" not in cols:
+        alters.append("ALTER TABLE users ADD COLUMN first_name TEXT")
+    if "last_name" not in cols:
+        alters.append("ALTER TABLE users ADD COLUMN last_name TEXT")
+    if "phone" not in cols:
+        alters.append("ALTER TABLE users ADD COLUMN phone TEXT")
+    if "telegram_username" not in cols:
+        alters.append("ALTER TABLE users ADD COLUMN telegram_username TEXT")
+    if "is_registered" not in cols:
+        alters.append("ALTER TABLE users ADD COLUMN is_registered INTEGER DEFAULT 0")
+    if "channels_subscribed" not in cols:
+        alters.append("ALTER TABLE users ADD COLUMN channels_subscribed INTEGER DEFAULT 0")
+    if "group_id" not in cols:
+        alters.append("ALTER TABLE users ADD COLUMN group_id INTEGER")
     for sql in alters:
         try:
             c.execute(sql)
@@ -130,11 +213,70 @@ def _migrate_users_columns(conn: sqlite3.Connection) -> None:
 
 
 def ensure_user(user_id: int) -> None:
-    with get_conn() as conn:
-        conn.execute(
-            "INSERT OR IGNORE INTO users (user_id) VALUES (?)",
-            (user_id,),
-        )
+    import time
+    import logging
+    logger = logging.getLogger(__name__)
+    
+    for attempt in range(_MAX_RETRIES):
+        try:
+            with get_conn() as conn:
+                conn.execute(
+                    "INSERT OR IGNORE INTO users (user_id) VALUES (?)",
+                    (user_id,),
+                )
+            return
+        except sqlite3.OperationalError as e:
+            if "database is locked" in str(e).lower() and attempt < _MAX_RETRIES - 1:
+                wait_time = 0.5 * (attempt + 1)
+                logger.warning("ensure_user locked, retry %d/%d after %.1fs", attempt + 1, _MAX_RETRIES, wait_time)
+                time.sleep(wait_time)
+            else:
+                raise
+
+
+def ensure_user_with_bonus(user_id: int, bonus_amount: float = 0.0) -> bool:
+    """
+    Foydalanuvchini yaratadi va agar kerak bo'lsa bonus tanga qo'shadi.
+    Bitta transaction da — locking muammosini kamaytiradi.
+    """
+    import time
+    import logging
+    logger = logging.getLogger(__name__)
+    
+    for attempt in range(_MAX_RETRIES):
+        try:
+            with get_conn() as conn:
+                # Avval foydalanuvchini yaratish
+                conn.execute(
+                    "INSERT OR IGNORE INTO users (user_id) VALUES (?)",
+                    (user_id,),
+                )
+                
+                # Agar bonus kerak bo'lsa
+                if bonus_amount > 0:
+                    cur = conn.execute("SELECT coins FROM users WHERE user_id = ?", (user_id,))
+                    row = cur.fetchone()
+                    current = float(row["coins"]) if row and row["coins"] is not None else 0
+                    
+                    if current == 0:  # Faqat birinchi marta
+                        new_balance = current + bonus_amount
+                        conn.execute("UPDATE users SET coins = ? WHERE user_id = ?", (new_balance, user_id))
+                        created = datetime.utcnow().isoformat() + "Z"
+                        conn.execute(
+                            """INSERT INTO transactions (user_id, created_at, amount, service_type, balance_after, detail_json)
+                               VALUES (?, ?, ?, ?, ?, ?)""",
+                            (user_id, created, bonus_amount, "initial_bonus", new_balance, json.dumps({"type": "credit"})),
+                        )
+                        return True  # Bonus berildi
+                return False  # Bonus berilmadi (allaqachon bor)
+        except sqlite3.OperationalError as e:
+            if "database is locked" in str(e).lower() and attempt < _MAX_RETRIES - 1:
+                wait_time = 0.5 * (attempt + 1)
+                logger.warning("ensure_user_with_bonus locked, retry %d/%d after %.1fs", attempt + 1, _MAX_RETRIES, wait_time)
+                time.sleep(wait_time)
+            else:
+                raise
+    return False
 
 
 def get_user_row(user_id: int) -> Optional[sqlite3.Row]:
@@ -394,3 +536,361 @@ def save_grammar_result(user_id: int, score: int, total: int, detail: dict) -> N
                VALUES (?, ?, ?, ?, ?)""",
             (user_id, created, score, total, json.dumps(detail, ensure_ascii=False)),
         )
+
+
+# =============================================================================
+# COINS / TANGA TIZIMI
+# =============================================================================
+
+def set_user_role(user_id: int, role: str) -> None:
+    """TEACHER yoki STUDENT rol o'rnatish."""
+    with get_conn() as conn:
+        conn.execute("UPDATE users SET role = ? WHERE user_id = ?", (role.upper(), user_id))
+
+
+def add_coins(user_id: int, amount: float, reason: str = "topup") -> float:
+    """Tanga qo'shish. Yangi balansni qaytaradi."""
+    with get_conn() as conn:
+        cur = conn.execute("SELECT coins FROM users WHERE user_id = ?", (user_id,))
+        row = cur.fetchone()
+        current = float(row["coins"]) if row and row["coins"] is not None else 0
+        new_balance = current + amount
+        conn.execute("UPDATE users SET coins = ? WHERE user_id = ?", (new_balance, user_id))
+        insert_transaction(user_id, amount, reason, new_balance, {"type": "credit"})
+        return new_balance
+
+
+def get_coins(user_id: int) -> float:
+    """Joriy tanga balansini qaytaradi."""
+    row = get_user_row(user_id)
+    if not row or row["coins"] is None:
+        return 0
+    return float(row["coins"])
+
+
+def check_coins(user_id: int, cost: float) -> bool:
+    """Yetarli tanga borligini tekshiradi."""
+    return get_coins(user_id) >= cost
+
+
+def deduct_coins(user_id: int, cost: float, service_type: str) -> tuple[bool, float]:
+    """
+    Tanga yechish. (muvaffaqiyat, qolgan_balans) tuple qaytaradi.
+    Agar yetarli bo'lmasa, (False, current_balance).
+    """
+    current = get_coins(user_id)
+    if current < cost:
+        return False, current
+    with get_conn() as conn:
+        new_balance = current - cost
+        conn.execute("UPDATE users SET coins = ? WHERE user_id = ?", (new_balance, user_id))
+        insert_transaction(user_id, -cost, service_type, new_balance, {"type": "debit"})
+        return True, new_balance
+
+
+def insert_transaction(user_id: int, amount: float, service_type: str, balance_after: float, detail: dict) -> None:
+    """Tranzaksiya yozuvini qo'shadi."""
+    created = datetime.utcnow().isoformat() + "Z"
+    with get_conn() as conn:
+        conn.execute(
+            """INSERT INTO transactions (user_id, created_at, amount, service_type, balance_after, detail_json)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (user_id, created, amount, service_type, balance_after, json.dumps(detail, ensure_ascii=False)),
+        )
+
+
+def get_transactions(user_id: int, limit: int = 20) -> list[sqlite3.Row]:
+    """Foydalanuvchining oxirgi tranzaksiyalarini qaytaradi."""
+    with get_conn() as conn:
+        cur = conn.execute(
+            """SELECT * FROM transactions WHERE user_id = ? ORDER BY id DESC LIMIT ?""",
+            (user_id, limit),
+        )
+        return cur.fetchall()
+
+
+# =============================================================================
+# TARIF LIMITLAR
+# =============================================================================
+
+def reset_daily_limits_if_needed(user_id: int) -> None:
+    """Agar yangi kun bo'lsa, kunlik limitlarni reset qiladi."""
+    today = date.today().isoformat()
+    with get_conn() as conn:
+        cur = conn.execute(
+            "SELECT daily_writing_date, daily_paraphrase_date FROM users WHERE user_id = ?",
+            (user_id,),
+        )
+        row = cur.fetchone()
+        if not row:
+            return
+        w_date = row["daily_writing_date"]
+        p_date = row["daily_paraphrase_date"]
+        if w_date != today:
+            conn.execute(
+                "UPDATE users SET daily_writing_count = 0, daily_writing_date = ? WHERE user_id = ?",
+                (today, user_id),
+            )
+        if p_date != today:
+            conn.execute(
+                "UPDATE users SET daily_paraphrase_count = 0, daily_paraphrase_date = ? WHERE user_id = ?",
+                (today, user_id),
+            )
+
+
+def get_daily_writing_count(user_id: int) -> int:
+    """Bugungi writing tahlillar soni."""
+    reset_daily_limits_if_needed(user_id)
+    row = get_user_row(user_id)
+    if not row or row["daily_writing_count"] is None:
+        return 0
+    return int(row["daily_writing_count"])
+
+
+def increment_daily_writing(user_id: int) -> int:
+    """Writing hisoblagichni oshiradi va yangi qiymatni qaytaradi."""
+    reset_daily_limits_if_needed(user_id)
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE users SET daily_writing_count = daily_writing_count + 1 WHERE user_id = ?",
+            (user_id,),
+        )
+        cur = conn.execute("SELECT daily_writing_count FROM users WHERE user_id = ?", (user_id,))
+        r = cur.fetchone()
+        return int(r["daily_writing_count"]) if r else 1
+
+
+def get_daily_paraphrase_count(user_id: int) -> int:
+    """Bugungi paraphrase o'yinlar soni."""
+    reset_daily_limits_if_needed(user_id)
+    row = get_user_row(user_id)
+    if not row or row["daily_paraphrase_count"] is None:
+        return 0
+    return int(row["daily_paraphrase_count"])
+
+
+def increment_daily_paraphrase(user_id: int) -> int:
+    """Paraphrase hisoblagichni oshiradi va yangi qiymatni qaytaradi."""
+    reset_daily_limits_if_needed(user_id)
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE users SET daily_paraphrase_count = daily_paraphrase_count + 1 WHERE user_id = ?",
+            (user_id,),
+        )
+        cur = conn.execute("SELECT daily_paraphrase_count FROM users WHERE user_id = ?", (user_id,))
+        r = cur.fetchone()
+        return int(r["daily_paraphrase_count"]) if r else 1
+
+
+def update_combo_streak(user_id: int, increment: bool = True) -> tuple[int, int]:
+    """
+    Combo streak ni yangilaydi.
+    (yangi_streak, qozonilgan_free_spin) qaytaradi.
+    3 combo -> 1 free spin, 5 combo -> 2 free spin.
+    """
+    row = get_user_row(user_id)
+    current_streak = int(row["combo_streak"]) if row and row["combo_streak"] is not None else 0
+    current_free = int(row["free_spins"]) if row and row["free_spins"] is not None else 0
+
+    if increment:
+        current_streak += 1
+    else:
+        current_streak = 0
+
+    earned_spin = 0
+    if current_streak == 3:
+        earned_spin = 1
+    elif current_streak == 5:
+        earned_spin = 2
+
+    if earned_spin > 0:
+        current_free += earned_spin
+        current_streak = 0  # reset after earning
+
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE users SET combo_streak = ?, free_spins = ? WHERE user_id = ?",
+            (current_streak, current_free, user_id),
+        )
+
+    return current_streak, earned_spin
+
+
+def get_paraphrase_reward(combo_streak: int) -> float:
+    """
+    Combo streak'ga qarab tanga mukofotini qaytaradi.
+    0: 0 tanga
+    1-3: 1.0 tanga
+    4-10: 1.2 tanga
+    10+: 1.5 tanga
+    """
+    if combo_streak <= 0:
+        return 0.0
+    elif combo_streak <= 3:
+        return 1.0
+    elif combo_streak <= 10:
+        return 1.2
+    else:
+        return 1.5
+
+
+def reset_combo_streak(user_id: int) -> None:
+    """Combo streak'ni 0 ga tushiradi (streak buzilganda)."""
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE users SET combo_streak = 0 WHERE user_id = ?",
+            (user_id,),
+        )
+
+
+def use_free_spin(user_id: int) -> bool:
+    """Bitta tekin baraban ishlatadi. Muvaffaqiyatli bo'lsa True."""
+    row = get_user_row(user_id)
+    free = int(row["free_spins"]) if row and row["free_spins"] is not None else 0
+    if free <= 0:
+        return False
+    with get_conn() as conn:
+        conn.execute("UPDATE users SET free_spins = free_spins - 1 WHERE user_id = ?", (user_id,))
+        return True
+
+
+def set_tariff(user_id: int, tariff: str, expires: str | None = None) -> None:
+    """Tarifni o'rnatadi."""
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE users SET tariff = ?, tariff_expires = ? WHERE user_id = ?",
+            (tariff.upper(), expires, user_id),
+        )
+
+
+def is_tariff_active(user_id: int) -> bool:
+    """Tarif hali amal qilishini tekshiradi."""
+    row = get_user_row(user_id)
+    if not row:
+        return False
+    tariff = row["tariff"] or "FREE"
+    expires = row["tariff_expires"]
+    if tariff == "FREE" or not expires:
+        return False
+    try:
+        exp_date = datetime.fromisoformat(expires)
+        return exp_date > datetime.now()
+    except (ValueError, TypeError):
+        return False
+
+
+# =============================================================================
+# REGISTRATSIYA
+# =============================================================================
+
+def update_user_profile(user_id: int, first_name: str | None = None, last_name: str | None = None,
+                        phone: str | None = None, telegram_username: str | None = None) -> None:
+    """Foydalanuvchi profilini yangilaydi."""
+    with get_conn() as conn:
+        if first_name is not None:
+            conn.execute("UPDATE users SET first_name = ? WHERE user_id = ?", (first_name, user_id))
+        if last_name is not None:
+            conn.execute("UPDATE users SET last_name = ? WHERE user_id = ?", (last_name, user_id))
+        if phone is not None:
+            conn.execute("UPDATE users SET phone = ? WHERE user_id = ?", (phone, user_id))
+        if telegram_username is not None:
+            conn.execute("UPDATE users SET telegram_username = ? WHERE user_id = ?", (telegram_username, user_id))
+
+
+def mark_registered(user_id: int) -> None:
+    """Foydalanuvchini ro'yxatdan o'tgan deb belgilaydi."""
+    with get_conn() as conn:
+        conn.execute("UPDATE users SET is_registered = 1 WHERE user_id = ?", (user_id,))
+
+
+def is_registered(user_id: int) -> bool:
+    """Foydalanuvchi ro'yxatdan o'tganligini tekshiradi."""
+    row = get_user_row(user_id)
+    if not row:
+        return False
+    return bool(row["is_registered"])
+
+
+def mark_channels_subscribed(user_id: int) -> None:
+    """Foydalanuvchi kanallarga obuna bo'lgan deb belgilaydi."""
+    with get_conn() as conn:
+        conn.execute("UPDATE users SET channels_subscribed = 1 WHERE user_id = ?", (user_id,))
+
+
+def is_channels_subscribed(user_id: int) -> bool:
+    """Foydalanuvchi kanallarga obuna bo'lganligini tekshiradi."""
+    row = get_user_row(user_id)
+    if not row:
+        return False
+    return bool(row["channels_subscribed"])
+
+
+# =============================================================================
+# GURUH (GROUPS) BOSHQARUVI
+# =============================================================================
+
+import random
+import string
+
+def generate_join_code(length: int = 8) -> str:
+    """Tasodifiy qo'shilish kodi generatsiya qiladi."""
+    chars = string.ascii_uppercase + string.digits
+    while True:
+        code = ''.join(random.choices(chars, k=length))
+        # Unikal ekanligini tekshirish
+        with get_conn() as conn:
+            cur = conn.execute("SELECT id FROM groups WHERE join_code = ?", (code,))
+            if not cur.fetchone():
+                return code
+
+
+def create_group(name: str, teacher_id: int) -> dict:
+    """Yangi guruh yaratadi. (id, name, join_code) qaytaradi."""
+    created = datetime.utcnow().isoformat() + "Z"
+    code = generate_join_code()
+    with get_conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO groups (name, join_code, teacher_id, created_at) VALUES (?, ?, ?, ?)",
+            (name, code, teacher_id, created),
+        )
+        return {"id": int(cur.lastrowid), "name": name, "join_code": code}
+
+
+def get_group_by_code(code: str) -> Optional[sqlite3.Row]:
+    """Qo'shilish kodi orqali guruh topadi."""
+    with get_conn() as conn:
+        cur = conn.execute("SELECT * FROM groups WHERE join_code = ?", (code.upper(),))
+        return cur.fetchone()
+
+
+def get_group_by_id(group_id: int) -> Optional[sqlite3.Row]:
+    """ID orqali guruh topadi."""
+    with get_conn() as conn:
+        cur = conn.execute("SELECT * FROM groups WHERE id = ?", (group_id,))
+        return cur.fetchone()
+
+
+def get_group_students(group_id: int) -> list[sqlite3.Row]:
+    """Guruhdagi o'quvchilar ro'yxatini qaytaradi."""
+    with get_conn() as conn:
+        cur = conn.execute(
+            "SELECT * FROM users WHERE group_id = ? ORDER BY user_id",
+            (group_id,),
+        )
+        return cur.fetchall()
+
+
+def set_group_id(user_id: int, group_id: Optional[int]) -> None:
+    """O'quvchini guruhga bog'laydi yoki ajratadi."""
+    with get_conn() as conn:
+        conn.execute("UPDATE users SET group_id = ? WHERE user_id = ?", (group_id, user_id))
+
+
+def get_teacher_groups(teacher_id: int) -> list[sqlite3.Row]:
+    """O'qituvchining barcha guruhlarini qaytaradi."""
+    with get_conn() as conn:
+        cur = conn.execute(
+            "SELECT * FROM groups WHERE teacher_id = ? ORDER BY created_at DESC",
+            (teacher_id,),
+        )
+        return cur.fetchall()
