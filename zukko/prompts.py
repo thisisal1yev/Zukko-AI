@@ -75,6 +75,29 @@ Create 5 multiple-choice English questions (Uzbek explanations after each answer
 Return JSON only: {{"questions":[{{"q":"...","options":["A","B","C","D"],"correct":0,"explain_uz":"..."}}]}}"""
 
 
+def paraphrase_extract_sentence_prompt(essay_text: str) -> str:
+    """
+    Essay dan paraphrase o'yini uchun eng yaxshi 1 ta jumlani tanlab olish.
+    AI eng mazmuni, murakkab va paraphrase qilishga arziydigan jumlani tanlaydi.
+    """
+    return f"""Sen ingliz tili o'qituvchisisan. Quyidagi essay dan paraphrase o'yini uchun eng yaxshi 1 ta jumlani tanlab ol.
+
+Tanlov mezonlari:
+- Jumla mazmuni boy bo'lsin (oddiy emas)
+- Grammatik jihatdan qiziqarli struktura bo'lsin
+- Paraphrase qilish mumkin bo'lsin (juda uzun yoki juda qisqa emas)
+- Essay ning asosiy fikrini ifodalovchi jumla bo'lsin
+
+Essay:
+---
+{essay_text}
+---
+
+Faqat 1 ta jumlani tanla va uni JSON formatda qaytar (boshqa hech narsa qo'shma):
+{{"sentence": "tanlangan jumla", "reason": "nega bu jumla tanlandi (qisqa, 10 so'z ichida)"}}
+"""
+
+
 def paraphrase_judge_prompt(original: str, user_rewrite: str) -> str:
     return f"""Original: {original}
 Learner rewrite: {user_rewrite}

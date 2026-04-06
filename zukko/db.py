@@ -686,6 +686,60 @@ def get_daily_paraphrase_count(user_id: int) -> int:
     return int(row["daily_paraphrase_count"])
 
 
+def get_user_latest_submissions(user_id: int, limit: int = 5) -> list[sqlite3.Row]:
+    """Foydalanuvchining oxirgi writing submission larini qaytaradi."""
+    with get_conn() as conn:
+        cur = conn.execute(
+            """SELECT id, transcript, scores_json, task_type, mode, overall_band, created_at
+               FROM writing_submissions
+               WHERE user_id = ? AND transcript IS NOT NULL AND transcript != ''
+               ORDER BY id DESC
+               LIMIT ?""",
+            (user_id, limit),
+        )
+        return cur.fetchall()
+
+
+def get_submission_keywords(submission_id: int) -> dict:
+    """Bitta submission dan keywords/collocations olish (scores_json dan)."""
+    with get_conn() as conn:
+        cur = conn.execute(
+            "SELECT scores_json FROM writing_submissions WHERE id = ?",
+            (submission_id,),
+        )
+        row = cur.fetchone()
+        if not row or not row["scores_json"]:
+            return {}
+        try:
+            data = json.loads(row["scores_json"])
+            return {
+                "topic": data.get("topic", ""),
+                "keywords": data.get("keywords", []),
+                "collocations": data.get("collocations", []),
+            }
+        except (json.JSONDecodeError, TypeError):
+            return {}
+
+
+def get_transcripts_for_paraphrase(user_id: int) -> list[dict]:
+    """
+    Paraphrase o'yini uchun foydalanuvchining essaylarini qaytaradi.
+    Har bir essay: {id, transcript, keywords, collocations, topic}
+    """
+    submissions = get_user_latest_submissions(user_id, limit=5)
+    result = []
+    for sub in submissions:
+        keywords_data = get_submission_keywords(sub["id"])
+        result.append({
+            "id": sub["id"],
+            "transcript": sub["transcript"],
+            "topic": keywords_data.get("topic", ""),
+            "keywords": keywords_data.get("keywords", []),
+            "collocations": keywords_data.get("collocations", []),
+        })
+    return result
+
+
 def increment_daily_paraphrase(user_id: int) -> int:
     """Paraphrase hisoblagichni oshiradi va yangi qiymatni qaytaradi."""
     reset_daily_limits_if_needed(user_id)

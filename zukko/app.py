@@ -1386,6 +1386,61 @@ def on_paraphrase_menu(message: types.Message) -> None:
     db.ensure_user(uid)
     db.reset_daily_limits_if_needed(uid)
 
+    # 1. Foydalanuvchining essaylari borligini tekshirish
+    essays = db.get_transcripts_for_paraphrase(uid)
+    if not essays:
+        # Essay yo'q — Writing bo'limiga yo'naltirish
+        markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+        markup.add(MENU_WRITING(db.get_user_row(uid)["mode"] if db.get_user_row(uid) else "IELTS"))
+        markup.add(BTN_BACK)
+        bot.send_message(
+            message.chat.id,
+            "⚠️ *Paraphrase o'yini* uchun sizga avval kamida bitta essay yozish kerak!\n\n"
+            "📝 Siz hali birorta ham writing tahlil qildirmagansiz.\n\n"
+            "Iltimos, avval *✍️ Writing Tahlili* bo'limidan o'z esseingizni yuboring. "
+            "AI uni tahlil qilgandan so'ng, essayingizdan jumla yoki so'zlar olib, "
+            "paraphrase o'ynash mumkin bo'ladi.\n\n"
+            "👇 Pastdagi tugmani bosib Writing bo'limiga o'ting:",
+            parse_mode="Markdown",
+            reply_markup=markup,
+        )
+        return
+
+    # 2. Essay bor — AI dan eng yaxshi jumlani tanlab olish
+    bot.send_message(message.chat.id, "🔁 Paraphrase o'yini — essayingizdan jumla tanlanmoqda...")
+
+    # Eng oxirgi essay dan foydalanamiz
+    latest_essay = essays[0]
+    essay_text = latest_essay["transcript"]
+
+    sys_prompt = prompts.paraphrase_extract_sentence_prompt(essay_text)
+    raw = ask_text_safe(sys_prompt, timeout=60)
+    data = extract_json_blob(raw)
+
+    sentence = (data or {}).get("sentence", "")
+    reason = (data or {}).get("reason", "")
+
+    # Agar AI jumla topa olmasa, fallback: birinchi uzunroq jumla
+    if not sentence:
+        import re
+        sentences = re.split(r'(?<=[.!?])\s+', essay_text)
+        for s in sentences:
+            if len(s) > 30 and len(s) < 200:
+                sentence = s
+                break
+        if not sentence and sentences:
+            sentence = sentences[0]
+
+    if not sentence:
+        bot.send_message(
+            message.chat.id,
+            "❌ Essayingizdan paraphrase qilish uchun jumla topilmadi. "
+            "Iltimos, batafsilroq essay yozib qayta urinib ko'ring.",
+            reply_markup=main_menu_markup(uid),
+        )
+        return
+
+    # 3. Paraphrase o'yinini boshlash
     paraphrase_count = db.get_daily_paraphrase_count(uid)
     row = db.get_user_row(uid)
     free_spins = row["free_spins"] if row else 0
@@ -1419,20 +1474,33 @@ def on_paraphrase_menu(message: types.Message) -> None:
             )
             return
 
-    # Paraphrase uchun jumla so'rash — chiqish tugmasi bilan
-    db.set_session(uid, "await_paraphrase", {})
+    # 4. Sessiyaga asl jumlani saqlash va foydalanuvchiga taklif
+    db.set_session(uid, "await_paraphrase", {
+        "original_sentence": sentence,
+        "essay_topic": latest_essay.get("topic", ""),
+        "extract_reason": reason,
+    })
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=1)
     kb.add(BTN_EXIT_GAME)
+
+    topic_info = ""
+    if latest_essay.get("topic"):
+        topic_info = f"📚 Mavzu: {latest_essay['topic']}\n"
+
     bot.send_message(
         message.chat.id,
-        "🔁 *Paraphrase o'yini*\n\n"
-        "Paraphrase qilmoqchi bo'lgan jumlani yozing. "
-        "AI uni baholaydi: ma'no saqlanganmi, tabiiylik, va yaxshiroq variant taklif qiladi.\n\n"
+        f"🔁 *Paraphrase o'yini*\n\n"
+        f"{topic_info}"
+        f"📝 *Sizning essayingizdan jumla:*\n\"{sentence}\"\n\n"
+        f"💡 _{reason}_\n\n"
+        f"Endi shu jumlani *o'z so'zlaringiz bilan qayta yozing* (paraphrase qiling). "
+        f"AI ma'no saqlanganmi, tabiiylik darajasi va yaxshiroq variantni baholaydi.\n\n"
+        f"━━━━━━━━━━━━━━━\n"
         f"🎯 Narx: {config.PARAPHRASE_COST} tanga (bepul limitdan keyin)\n"
         f"🔥 Combo: {combo} ketma-ket\n"
-        f"🎰 Tekin barabanlar: {free_spins}\n\n"
-        f"Bugungi: {paraphrase_count}/{config.PARAPHRASE_DAILY_FREE} (bepul)\n\n"
-        "Jumlani yozing:",
+        f"🎰 Tekin barabanlar: {free_spins}\n"
+        f"📊 Bugungi: {paraphrase_count}/{config.PARAPHRASE_DAILY_FREE} (bepul)\n\n"
+        f"✍️ Paraphrase variantni yozing:",
         parse_mode="Markdown",
         reply_markup=kb,
     )
@@ -1485,14 +1553,14 @@ def on_paraphrase_submit(message: types.Message) -> None:
     if not user_rewrite:
         return
 
-    # Agar bu foydalanuvchi kiritgan jumla bo'lsa (o'yin boshlanishi)
+    # Session context dan asl jumlani olish (AI tomonidan essay dan tanlab olingan)
     ctx = db.session_context(uid)
     original = ctx.get("original_sentence")
 
     if not original:
-        # Bu foydalanuvchi kiritgan asl jumla — AI dan paraphrase so'rash
+        # Bu eski logika fallback — agar session da original bo'lmasa
+        # Bu holat endi kutilmaydi, lekin xavfsizlik uchun qoldiriladi
         db.update_session_context(uid, original_sentence=user_rewrite)
-        # Chiqish tugmasini qayta ko'rsatish
         kb = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=1)
         kb.add(BTN_EXIT_GAME)
         bot.send_message(
