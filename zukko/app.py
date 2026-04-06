@@ -4,6 +4,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
+import tempfile
 from pathlib import Path
 
 import telebot
@@ -146,26 +148,30 @@ def teacher_menu_markup(user_id: int) -> types.ReplyKeyboardMarkup:
     return m
 
 
-def _blocked_states() -> frozenset:
-    """Qaysi state lar fallback dan himoyalanganligini qaytaradi."""
-    return frozenset((
-        "await_teacher_id",
-        "waiting_writing",
-        "pick_task",
-        "await_paraphrase",
-        "await_vocab_topic",
-        "paraphrase_payment_pick",
-        "group_report_period_pick",
-        "reg_ask_fullname",
-        "reg_ask_phone",
-        "reg_ask_role",
-        "profile_edit_firstname",
-        "profile_edit_lastname",
-        "profile_edit_phone",
-        "await_group_code",
-        "await_create_group_name",
-        "group_menu_idle",
-    ))
+_BLOCKED_STATES = frozenset((
+    "await_teacher_id",
+    "waiting_writing",
+    "pick_task",
+    "await_paraphrase",
+    "await_vocab_topic",
+    "paraphrase_payment_pick",
+    "group_report_period_pick",
+    "reg_ask_fullname",
+    "reg_ask_phone",
+    "reg_ask_role",
+    "profile_edit_firstname",
+    "profile_edit_lastname",
+    "profile_edit_phone",
+    "await_group_code",
+    "await_create_group_name",
+    "group_menu_idle",
+))
+
+_PHONE_RE = re.compile(r"^\+?\d{7,15}$")
+
+
+def _valid_phone(phone: str) -> bool:
+    return bool(_PHONE_RE.match(phone))
 
 
 def task_pick_markup() -> types.ReplyKeyboardMarkup:
@@ -208,7 +214,7 @@ def process_writing(
         cost = 0.0
     else:
         # Bepul limitdan keyin — to'lov
-        cost = config.WRITING_EXTRA_COST if writing_today >= config.WRITING_DAILY_FREE else config.WRITING_ANALYSIS_COST
+        cost = config.WRITING_EXTRA_COST
         if not db.check_coins(user_id, cost):
             bot.send_message(
                 chat_id,
@@ -476,8 +482,8 @@ def on_reg_phone_text(message: types.Message) -> None:
     if uid is None or not message.text:
         return
     phone = message.text.strip()
-    if not phone or len(phone) < 7:
-        bot.send_message(message.chat.id, "❌ Iltimos, to'g'ri telefon raqam kiriting:")
+    if not phone or not _valid_phone(phone):
+        bot.send_message(message.chat.id, "❌ Iltimos, to'g'ri telefon raqam kiriting (masalan: +998901234567):")
         return
     db.update_user_profile(uid, phone=phone)
     # Rol tanlash bosqichiga o'tish
@@ -547,7 +553,7 @@ def on_role_select(call: types.CallbackQuery) -> None:
     uid = call.from_user.id
     role = "STUDENT" if call.data == "role_student" else "TEACHER"
     db.set_user_role(uid, role)
-    db.mark_registeredGG(uid)  # Registratsiyani tugatish
+    db.mark_registered(uid)  # Registratsiyani tugatish
     bot.answer_callback_query(call.id, f"✅ Rol tanlandi: {'O\'quvchi' if role == 'STUDENT' else 'O\'qituvchi'}")
     bot.delete_message(call.message.chat.id, call.message.message_id)
     # Kanal obunasini tekshirish
@@ -605,7 +611,21 @@ def on_check_subscription(call: types.CallbackQuery) -> None:
             bot.delete_message(call.message.chat.id, call.message.message_id)
             _complete_registration(uid, call.message.chat.id)
         else:
-            bot.answer_callback_query(call.id, "❌ Siz hali kanallarga obuna bo'lmagansiz!", show_alert=True)
+            # Qaysi kanallarga obuna bo'lmaganini aniqlash
+            not_subscribed = []
+            if member1.status not in ("member", "administrator", "creator"):
+                not_subscribed.append(f"@{config.PROJECT_CHANNEL}")
+            if member2.status not in ("member", "administrator", "creator"):
+                not_subscribed.append(f"@{config.SPONSOR_CHANNEL}")
+            
+            # Aniq xabar
+            channels_str = " va ".join(not_subscribed)
+            suffix = "lariga" if len(not_subscribed) > 1 else "iga"
+            bot.answer_callback_query(
+                call.id, 
+                f"❌ Siz {channels_str} kanal{suffix} obuna bo'lmagansiz!", 
+                show_alert=True
+            )
     except Exception as e:
         error_msg = str(e)
         logger.warning("Subscription check callback failed: %s", e)
@@ -708,12 +728,11 @@ def _check_channel_or_block(uid: int, chat_id: int) -> bool:
         pass
     # Obuna bo'lmagan — tugma ko'rsatish
     markup = types.InlineKeyboardMarkup()
-    if config.PROJECT_CHANNEL_URL:
+    if config.PROJECT_CHANNEL_URL and "project" in not_subscribed:
         markup.add(types.InlineKeyboardButton("📢 Project Kanal", url=config.PROJECT_CHANNEL_URL))
-    if config.SPONSOR_CHANNEL_URL:
+    if config.SPONSOR_CHANNEL_URL and True:
         markup.add(types.InlineKeyboardButton("🤝 Sponsor Kanal", url=config.SPONSOR_CHANNEL_URL))
     markup.add(types.InlineKeyboardButton("✅ Obuna bo'ldim", callback_data="check_subscription"))
-    markup.add(types.InlineKeyboardButton("✅ Men obuna bo'ldim (tasdiqlash)", callback_data="confirm_subscribed_manual"))
     bot.send_message(
         chat_id,
         "⚠️ Botdan foydalanish uchun kanallarga obuna bo'ling:\n\n"
@@ -770,6 +789,11 @@ def on_photo(message: types.Message) -> None:
     if uid is None:
         return
     db.ensure_user(uid)
+    if not db.is_registered(uid):
+        bot.send_message(message.chat.id, "⚠️ Avval ro'yxatdan o'ting. /start ni bosing.")
+        return
+    if not _check_channel_or_block(uid, message.chat.id):
+        return
     row = db.get_user_row(uid)
     mode = row["mode"] if row else "IELTS"
     sess = db.get_session(uid)
@@ -779,7 +803,7 @@ def on_photo(message: types.Message) -> None:
         ctx = db.session_context(uid)
         task_type = ctx.get("task_type") or task_type
 
-    path = f"essay_{uid}_{message.message_id}.jpg"
+    path: str | None = None
     try:
         bot.send_message(message.chat.id, "🧐 AI examiner tahlil qilmoqda...")
         photos = message.photo
@@ -792,6 +816,8 @@ def on_photo(message: types.Message) -> None:
             bot.send_message(message.chat.id, "⚠️ Fayl yo'li mavjud emas.")
             return
         data = bot.download_file(fp)
+        fd, path = tempfile.mkstemp(suffix=".jpg")
+        os.close(fd)
         with open(path, "wb") as f:
             f.write(data)
         process_writing(message.chat.id, uid, mode, task_type, "image", None, path)
@@ -799,7 +825,7 @@ def on_photo(message: types.Message) -> None:
         logger.exception("photo fail: %s", e)
         bot.send_message(message.chat.id, "⚠️ Xatolik yuz berdi.")
     finally:
-        if os.path.exists(path):
+        if path and os.path.exists(path):
             try:
                 os.remove(path)
             except OSError:
@@ -948,23 +974,7 @@ def _fallback_allowed(message: types.Message) -> bool:
     if message.content_type != "text" or not message.text:
         return False
     t = message.text
-    blocked = {
-        BTN_TUTOR,
-        BTN_DIRECTION,
-        BTN_TEACHER,
-        BTN_VOCAB,
-        BTN_PARAPHRASE,
-        IELTS_START,
-        CEFR_START,
-        BTN_BACK,
-        BTN_BALANCE,
-        BTN_UPGRADE_COINS,
-        BTN_GROUP_REPORT,
-        BTN_PROFILE,
-        BTN_CREATE_GROUP,
-        BTN_MY_GROUPS,
-    }
-    if t in blocked or t in TASK_BTN:
+    if t in _ALL_MENU_BUTTONS or t in TASK_BTN:
         return False
     if _starts_writing(t):
         return False
@@ -972,7 +982,7 @@ def _fallback_allowed(message: types.Message) -> bool:
     if uid is None:
         return False
     sess = db.get_session(uid)
-    if sess and sess["state"] in _blocked_states():
+    if sess and sess["state"] in _BLOCKED_STATES:
         return False
     return True
 
@@ -1351,8 +1361,8 @@ def on_profile_edit_phone_text(message: types.Message) -> None:
         bot.send_message(message.chat.id, "Bekor qilindi.", reply_markup=main_menu_markup(uid))
         return
     phone = message.text.strip()
-    if not phone or len(phone) < 7:
-        bot.send_message(message.chat.id, "❌ Iltimos, to'g'ri telefon raqam kiriting:")
+    if not phone or not _valid_phone(phone):
+        bot.send_message(message.chat.id, "❌ Iltimos, to'g'ri telefon raqam kiriting (masalan: +998901234567):")
         return
     db.update_user_profile(uid, phone=phone)
     db.clear_session(uid)
@@ -1416,12 +1426,13 @@ def on_paraphrase_menu(message: types.Message) -> None:
     bot.send_message(
         message.chat.id,
         "🔁 *Paraphrase o'yini*\n\n"
-        "Men sizga inglizcha jumla beraman. Siz uni o'z so'zlaringiz bilan qayta yozing.\n\n"
+        "Paraphrase qilmoqchi bo'lgan jumlani yozing. "
+        "AI uni baholaydi: ma'no saqlanganmi, tabiiylik, va yaxshiroq variant taklif qiladi.\n\n"
         f"🎯 Narx: {config.PARAPHRASE_COST} tanga (bepul limitdan keyin)\n"
         f"🔥 Combo: {combo} ketma-ket\n"
         f"🎰 Tekin barabanlar: {free_spins}\n\n"
         f"Bugungi: {paraphrase_count}/{config.PARAPHRASE_DAILY_FREE} (bepul)\n\n"
-        "Paraphrase qilmoqchi bo'lgan jumlani yozing:",
+        "Jumlani yozing:",
         parse_mode="Markdown",
         reply_markup=kb,
     )
@@ -1723,17 +1734,7 @@ def on_group_report(message: types.Message) -> None:
         return
 
     # O'qituvchining o'quvchilarini olish
-    with db.get_conn() as conn:
-        cur = conn.execute(
-            """SELECT u.user_id, u.mode, u.coins, u.tariff,
-                      ws.overall_band, ws.cefr_level, ws.created_at, ws.task_type
-               FROM users u
-               LEFT JOIN writing_submissions ws ON u.user_id = ws.user_id
-               WHERE u.teacher_id = ?
-               ORDER BY ws.created_at DESC""",
-            (uid,),
-        )
-        students = cur.fetchall()
+    students = db.get_teacher_students_with_submissions(uid)
 
     if not students:
         bot.send_message(
@@ -1787,18 +1788,7 @@ def on_group_report_period(message: types.Message) -> None:
     period = period_map.get(message.text, "haftalik")
 
     # O'quvchilar ma'lumotlarini yig'ish
-    with db.get_conn() as conn:
-        cur = conn.execute(
-            """SELECT u.user_id,
-                      AVG(ws.overall_band) as avg_band,
-                      COUNT(ws.id) as writing_count
-               FROM users u
-               INNER JOIN writing_submissions ws ON u.user_id = ws.user_id
-               WHERE u.teacher_id = ?
-               GROUP BY u.user_id""",
-            (uid,),
-        )
-        student_stats = cur.fetchall()
+    student_stats = db.get_student_stats_by_teacher(uid)
 
     if not student_stats:
         bot.send_message(

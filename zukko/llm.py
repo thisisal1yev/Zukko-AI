@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import base64
-import json
 import logging
 from typing import Any, Optional
 
@@ -49,9 +48,8 @@ def ask_vision(prompt: str, image_path: str, timeout: int = 120) -> str:
         config.OPENROUTER_URL,
         headers={
             "Authorization": f"Bearer {config.OPENROUTER_VISION_KEY}",
-            "Content-Type": "application/json",
         },
-        data=json.dumps(payload),
+        json=payload,
         timeout=timeout,
     )
     r.raise_for_status()
@@ -67,9 +65,8 @@ def ask_text(prompt: str, timeout: int = 90) -> str:
         config.OPENROUTER_URL,
         headers={
             "Authorization": f"Bearer {config.OPENROUTER_TEXT_KEY}",
-            "Content-Type": "application/json",
         },
-        data=json.dumps(payload),
+        json=payload,
         timeout=timeout,
     )
     r.raise_for_status()

@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import json
+import random
 import sqlite3
+import string
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 from typing import Any, Optional
@@ -575,16 +577,31 @@ def check_coins(user_id: int, cost: float) -> bool:
 
 def deduct_coins(user_id: int, cost: float, service_type: str) -> tuple[bool, float]:
     """
-    Tanga yechish. (muvaffaqiyat, qolgan_balans) tuple qaytaradi.
-    Agar yetarli bo'lmasa, (False, current_balance).
+    Tanga yechish. Atomar UPDATE — TOCTOU yo'q.
+    (muvaffaqiyat, qolgan_balans) tuple qaytaradi.
     """
-    current = get_coins(user_id)
-    if current < cost:
-        return False, current
+    created = datetime.utcnow().isoformat() + "Z"
+    detail = json.dumps({"type": "debit"}, ensure_ascii=False)
     with get_conn() as conn:
-        new_balance = current - cost
-        conn.execute("UPDATE users SET coins = ? WHERE user_id = ?", (new_balance, user_id))
-        insert_transaction(user_id, -cost, service_type, new_balance, {"type": "debit"})
+        cur = conn.execute(
+            "UPDATE users SET coins = coins - ? WHERE user_id = ? AND coins >= ?",
+            (cost, user_id, cost),
+        )
+        if cur.rowcount == 0:
+            # Yetarli emas yoki foydalanuvchi yo'q
+            cur = conn.execute("SELECT coins FROM users WHERE user_id = ?", (user_id,))
+            row = cur.fetchone()
+            current = float(row["coins"]) if row and row["coins"] is not None else 0
+            return False, current
+        # Muvaffaqiyatli — yangi balansni o'qish va transaction yozish
+        cur = conn.execute("SELECT coins FROM users WHERE user_id = ?", (user_id,))
+        row = cur.fetchone()
+        new_balance = float(row["coins"]) if row and row["coins"] is not None else 0
+        conn.execute(
+            """INSERT INTO transactions (user_id, created_at, amount, service_type, balance_after, detail_json)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (user_id, created, -cost, service_type, new_balance, detail),
+        )
         return True, new_balance
 
 
@@ -785,16 +802,24 @@ def is_tariff_active(user_id: int) -> bool:
 
 def update_user_profile(user_id: int, first_name: str | None = None, last_name: str | None = None,
                         phone: str | None = None, telegram_username: str | None = None) -> None:
-    """Foydalanuvchi profilini yangilaydi."""
+    """Foydalanuvchi profilini bitta UPDATE bilan yangilaydi."""
+    fields = {}
+    if first_name is not None:
+        fields["first_name"] = first_name
+    if last_name is not None:
+        fields["last_name"] = last_name
+    if phone is not None:
+        fields["phone"] = phone
+    if telegram_username is not None:
+        fields["telegram_username"] = telegram_username
+    if not fields:
+        return
+    set_clause = ", ".join(f"{k} = ?" for k in fields)
     with get_conn() as conn:
-        if first_name is not None:
-            conn.execute("UPDATE users SET first_name = ? WHERE user_id = ?", (first_name, user_id))
-        if last_name is not None:
-            conn.execute("UPDATE users SET last_name = ? WHERE user_id = ?", (last_name, user_id))
-        if phone is not None:
-            conn.execute("UPDATE users SET phone = ? WHERE user_id = ?", (phone, user_id))
-        if telegram_username is not None:
-            conn.execute("UPDATE users SET telegram_username = ? WHERE user_id = ?", (telegram_username, user_id))
+        conn.execute(
+            f"UPDATE users SET {set_clause} WHERE user_id = ?",
+            (*fields.values(), user_id),
+        )
 
 
 def mark_registered(user_id: int) -> None:
@@ -829,31 +854,29 @@ def is_channels_subscribed(user_id: int) -> bool:
 # GURUH (GROUPS) BOSHQARUVI
 # =============================================================================
 
-import random
-import string
 
 def generate_join_code(length: int = 8) -> str:
     """Tasodifiy qo'shilish kodi generatsiya qiladi."""
     chars = string.ascii_uppercase + string.digits
-    while True:
-        code = ''.join(random.choices(chars, k=length))
-        # Unikal ekanligini tekshirish
-        with get_conn() as conn:
-            cur = conn.execute("SELECT id FROM groups WHERE join_code = ?", (code,))
-            if not cur.fetchone():
-                return code
+    return ''.join(random.choices(chars, k=length))
 
 
 def create_group(name: str, teacher_id: int) -> dict:
-    """Yangi guruh yaratadi. (id, name, join_code) qaytaradi."""
+    """Yangi guruh yaratadi. (id, name, join_code) qaytaradi.
+    Unikal kod uchun IntegrityError + retry ishlatadi."""
     created = datetime.utcnow().isoformat() + "Z"
-    code = generate_join_code()
-    with get_conn() as conn:
-        cur = conn.execute(
-            "INSERT INTO groups (name, join_code, teacher_id, created_at) VALUES (?, ?, ?, ?)",
-            (name, code, teacher_id, created),
-        )
-        return {"id": int(cur.lastrowid), "name": name, "join_code": code}
+    for _ in range(10):
+        code = generate_join_code()
+        try:
+            with get_conn() as conn:
+                cur = conn.execute(
+                    "INSERT INTO groups (name, join_code, teacher_id, created_at) VALUES (?, ?, ?, ?)",
+                    (name, code, teacher_id, created),
+                )
+                return {"id": int(cur.lastrowid), "name": name, "join_code": code}
+        except sqlite3.IntegrityError:
+            continue  # kod takrorlangan — qayta generatsiya
+    raise RuntimeError("create_group: failed to generate unique code after 10 attempts")
 
 
 def get_group_by_code(code: str) -> Optional[sqlite3.Row]:
@@ -891,6 +914,37 @@ def get_teacher_groups(teacher_id: int) -> list[sqlite3.Row]:
     with get_conn() as conn:
         cur = conn.execute(
             "SELECT * FROM groups WHERE teacher_id = ? ORDER BY created_at DESC",
+            (teacher_id,),
+        )
+        return cur.fetchall()
+
+
+def get_teacher_students_with_submissions(teacher_id: int) -> list[sqlite3.Row]:
+    """O'qituvchining barcha o'quvchilari va ularning writing yozuvlarini qaytaradi."""
+    with get_conn() as conn:
+        cur = conn.execute(
+            """SELECT u.user_id, u.mode, u.coins, u.tariff,
+                      ws.overall_band, ws.cefr_level, ws.created_at, ws.task_type
+               FROM users u
+               LEFT JOIN writing_submissions ws ON u.user_id = ws.user_id
+               WHERE u.teacher_id = ?
+               ORDER BY ws.created_at DESC""",
+            (teacher_id,),
+        )
+        return cur.fetchall()
+
+
+def get_student_stats_by_teacher(teacher_id: int) -> list[sqlite3.Row]:
+    """O'qituvchining o'quvchilari bo'yicha statistika (avg band, writing count)."""
+    with get_conn() as conn:
+        cur = conn.execute(
+            """SELECT u.user_id,
+                      AVG(ws.overall_band) as avg_band,
+                      COUNT(ws.id) as writing_count
+               FROM users u
+               INNER JOIN writing_submissions ws ON u.user_id = ws.user_id
+               WHERE u.teacher_id = ?
+               GROUP BY u.user_id""",
             (teacher_id,),
         )
         return cur.fetchall()
