@@ -9,10 +9,11 @@ import tempfile
 from pathlib import Path
 
 import telebot
-from telebot import types  # pyright: ignore[reportMissingImports]
+from telebot import types
 
 from zukko import config
 from zukko import db
+from zukko import wheel
 from zukko import prompts
 from zukko.llm import ask_text_safe, ask_vision_safe
 from zukko.parse_json import extract_json_blob
@@ -39,6 +40,9 @@ BTN_DIRECTION = "⬅️ Yo'nalish"
 BTN_TEACHER = "👨‍🏫 Guruhga qo'shilish"
 BTN_VOCAB = "📚 Vocabulary Booster"
 BTN_PARAPHRASE = "🔁 Paraphrase o'yini"
+BTN_WHEEL = "🎰 Baraban O'yini"
+BTN_BASIC_WHEEL = "🎰 Oddiy Baraban"
+BTN_PREMIUM_WHEEL = "💎 Premium Baraban"
 
 TASK_BTN = {"📊 Task 1": "task1", "📝 Task 2": "task2", "✉️ Letter": "letter"}
 
@@ -68,6 +72,9 @@ _ALL_MENU_BUTTONS = frozenset(
         BTN_TEACHER,
         BTN_VOCAB,
         BTN_PARAPHRASE,
+        BTN_WHEEL,
+        BTN_BASIC_WHEEL,
+        BTN_PREMIUM_WHEEL,
         IELTS_START,
         CEFR_START,
         BTN_BACK,
@@ -122,6 +129,7 @@ def main_menu_markup(user_id: int) -> types.ReplyKeyboardMarkup:
         BTN_TUTOR,
         BTN_VOCAB,
         BTN_PARAPHRASE,
+        BTN_WHEEL,
         BTN_BALANCE,
         BTN_PROFILE,
         BTN_UPGRADE_COINS,
@@ -140,6 +148,7 @@ def teacher_menu_markup(user_id: int) -> types.ReplyKeyboardMarkup:
         BTN_PROFILE,
         BTN_CREATE_GROUP,
         BTN_MY_GROUPS,
+        BTN_WHEEL,
         BTN_BALANCE,
         BTN_UPGRADE_COINS,
         BTN_GROUP_REPORT,
@@ -987,6 +996,19 @@ def _fallback_allowed(message: types.Message) -> bool:
     return True
 
 
+@bot.message_handler(func=lambda m: m.text == BTN_BACK)
+def on_back(message: types.Message) -> None:
+    uid = _user_id(message)
+    if uid is None:
+        return
+    db.clear_session(uid)
+    bot.send_message(
+        message.chat.id,
+        "🏠 Asosiy menyu:",
+        reply_markup=main_menu_markup(uid),
+    )
+
+
 @bot.message_handler(func=_fallback_allowed)
 def on_fallback_text(message: types.Message) -> None:
     uid = _user_id(message)
@@ -1671,6 +1693,284 @@ def on_paraphrase_submit(message: types.Message) -> None:
     )
 
 
+# ── Baraban (Wheel) Tizimi ───────────────────────────────────────────────
+
+@bot.message_handler(func=lambda m: m.text == BTN_WHEEL)
+def on_wheel_menu(message: types.Message) -> None:
+    uid = _user_id(message)
+    if uid is None:
+        return
+    if not _check_channel_or_block(uid, message.chat.id):
+        return
+    db.ensure_user(uid)
+
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=1)
+    markup.add(BTN_BASIC_WHEEL, BTN_PREMIUM_WHEEL)
+    markup.add(BTN_BACK)
+
+    bot.send_message(
+        message.chat.id,
+        "🎰 *Baraban O'yini*\n\n"
+        "Qaysi barabanni tanlaysiz?",
+        parse_mode="Markdown",
+        reply_markup=markup,
+    )
+
+
+@bot.message_handler(func=lambda m: m.text == BTN_BASIC_WHEEL)
+def on_basic_wheel_menu(message: types.Message) -> None:
+    uid = _user_id(message)
+    if uid is None:
+        return
+    if not _check_channel_or_block(uid, message.chat.id):
+        return
+    db.ensure_user(uid)
+
+    cost = config.WHEEL_BASIC_COST
+    balance = db.get_coins(uid)
+
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    markup.add("🎰 Aylantirish!", BTN_BACK)
+
+    bot.send_message(
+        message.chat.id,
+        f"🎰 *ODDIY BARABAN*\n\n"
+        f"💰 Narx: {cost} tanga\n"
+        f"📊 Sizning balansingiz: {balance:.1f} tanga\n\n"
+        f"🎁 Sovg'alar:\n"
+        f"📚 Vocab Booster — 1 marta bepul Vocabulary\n"
+        f"📝 Writing One-Shot — 1 marta bepul Writing\n"
+        f"🔄 1 Kunlik Paraphrase — 24 soat cheksiz\n"
+        f"💰 10 Tanga — Balansga bonus\n"
+        f"⚡ 1 Kunlik Tutor — 1 kun cheksiz muloqot\n"
+        f"🎲 RE-SPIN — Yana bir bor aylantirish!\n\n"
+        f"Omad sinash uchun *🎰 Aylantirish!* tugmasini bosing:",
+        parse_mode="Markdown",
+        reply_markup=markup,
+    )
+    db.set_session(uid, "basic_wheel_pick", {})
+
+
+@bot.message_handler(func=lambda m: m.text == "🎰 Aylantirish!" and _sess_state(m, "basic_wheel_pick"))
+def on_basic_wheel_spin(message: types.Message) -> None:
+    uid = _user_id(message)
+    if uid is None:
+        return
+
+    cost = config.WHEEL_BASIC_COST
+
+    # Lucky Days tekshirish — 3 kun bepul oddiy baraban
+    if db.has_active_reward(uid, "lucky_days"):
+        cost = 0
+        spin_msg = "🎰 *Lucky Days* faol — sizga Oddiy Baraban BEPUL!\n\n"
+    elif not db.check_coins(uid, cost):
+        bot.send_message(
+            message.chat.id,
+            f"❌ Yetarli tanga yo'q!\n\n"
+            f"💰 Narx: {cost} tanga\n"
+            f"📊 Balans: {db.get_coins(uid):.1f} tanga",
+            reply_markup=main_menu_markup(uid),
+        )
+        db.clear_session(uid)
+        return
+    else:
+        spin_msg = ""
+
+    # Tanga yechish
+    if cost > 0:
+        ok, balance = db.deduct_coins(uid, cost, "wheel_basic")
+        if not ok:
+            bot.send_message(
+                message.chat.id,
+                f"❌ Yetarli tanga yo'q. Kerak: {cost} tanga, balans: {balance:.1f}",
+                reply_markup=main_menu_markup(uid),
+            )
+            db.clear_session(uid)
+            return
+
+    # Baraban aylantirish
+    result = wheel.spin_basic_wheel(uid)
+
+    # Agar RE-SPIN tushgan bo'lsa — yana bir bor aylantirish
+    if result["reward"]["type"] == "re_spin":
+        # RE-SPIN — qo'shimcha spin berish
+        result_text = result["result_text"]
+        result_text += "\n\n🎲 *RE-SPIN!* Yana bir bor aylantirasiz!\n"
+
+        markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+        markup.add("🔄 Qayta aylantirish!", BTN_BACK)
+        db.set_session(uid, "basic_wheel_respin", {})
+
+        bot.send_message(
+            message.chat.id,
+            result_text,
+            parse_mode="Markdown",
+            reply_markup=markup,
+        )
+        return
+
+    # Natijani ko'rsatish
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.add(BTN_BASIC_WHEEL, BTN_PREMIUM_WHEEL)
+    markup.add(BTN_BACK)
+
+    bot.send_message(
+        message.chat.id,
+        result["result_text"],
+        parse_mode="Markdown",
+        reply_markup=markup,
+    )
+    db.clear_session(uid)
+
+
+@bot.message_handler(func=lambda m: m.text == "🔄 Qayta aylantirish!" and _sess_state(m, "basic_wheel_respin"))
+def on_basic_wheel_respin_spin(message: types.Message) -> None:
+    """RE-SPIN uchun qayta aylantirish."""
+    uid = _user_id(message)
+    if uid is None:
+        return
+
+    # BEPUL aylantirish (RE-SPIN)
+    result = wheel.spin_basic_wheel(uid)
+
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.add(BTN_BASIC_WHEEL, BTN_PREMIUM_WHEEL)
+    markup.add(BTN_BACK)
+
+    bot.send_message(
+        message.chat.id,
+        result["result_text"],
+        parse_mode="Markdown",
+        reply_markup=markup,
+    )
+    db.clear_session(uid)
+
+
+# =============================================================================
+# PREMIUM BARABAN
+# =============================================================================
+
+@bot.message_handler(func=lambda m: m.text == BTN_PREMIUM_WHEEL)
+def on_premium_wheel_menu(message: types.Message) -> None:
+    uid = _user_id(message)
+    if uid is None:
+        return
+    if not _check_channel_or_block(uid, message.chat.id):
+        return
+    db.ensure_user(uid)
+
+    cost = config.WHEEL_PREMIUM_COST
+    balance = db.get_coins(uid)
+
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    markup.add("💎 Aylantirish!", BTN_BACK)
+
+    bot.send_message(
+        message.chat.id,
+        f"💎 *PREMIUM BARABAN*\n\n"
+        f"💰 Narx: {cost} tanga\n"
+        f"📊 Sizning balansingiz: {balance:.1f} tanga\n\n"
+        f"🎁 Qimmatli sovg'alar:\n"
+        f"💰 40 Tanga (Cashback) — Tikkan pul qaytadi\n"
+        f"📝 Writing Pro — 2 kun bepul Writing tahlili\n"
+        f"📚 Vocab King — 3 kun cheksiz Vocabulary\n"
+        f"💎 JEKPOT — 1 hafta cheksiz Paraphrase!\n"
+        f"🎰 Lucky Days — 3 kun bepul Oddiy Baraban\n"
+        f"🔄 MEGA RE-SPIN — Qayta aylantirish + 5 TANGA!\n\n"
+        f"Omad sinash uchun *💎 Aylantirish!* tugmasini bosing:",
+        parse_mode="Markdown",
+        reply_markup=markup,
+    )
+    db.set_session(uid, "premium_wheel_pick", {})
+
+
+@bot.message_handler(func=lambda m: m.text == "💎 Aylantirish!" and _sess_state(m, "premium_wheel_pick"))
+def on_premium_wheel_spin(message: types.Message) -> None:
+    uid = _user_id(message)
+    if uid is None:
+        return
+
+    cost = config.WHEEL_PREMIUM_COST
+
+    if not db.check_coins(uid, cost):
+        bot.send_message(
+            message.chat.id,
+            f"❌ Yetarli tanga yo'q!\n\n"
+            f"💰 Narx: {cost} tanga\n"
+            f"📊 Balans: {db.get_coins(uid):.1f} tanga",
+            reply_markup=main_menu_markup(uid),
+        )
+        db.clear_session(uid)
+        return
+
+    # Tanga yechish
+    ok, balance = db.deduct_coins(uid, cost, "wheel_premium")
+    if not ok:
+        bot.send_message(
+            message.chat.id,
+            f"❌ Yetarli tanga yo'q. Kerak: {cost} tanga, balans: {balance:.1f}",
+            reply_markup=main_menu_markup(uid),
+        )
+        db.clear_session(uid)
+        return
+
+    # Baraban aylantirish
+    result = wheel.spin_premium_wheel(uid)
+
+    # Agar MEGA RE-SPIN tushgan bo'lsa — qayta aylantirish
+    if result["reward"]["type"] == "mega_re_spin":
+        result_text = result["result_text"]
+        result_text += "\n\n🔄 *MEGA RE-SPIN!* Yana bir bor aylantirasiz + 5 tanga qo'shildi!\n"
+
+        markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+        markup.add("🔄 Qayta aylantirish!", BTN_BACK)
+        db.set_session(uid, "premium_wheel_mega_respin", {})
+
+        bot.send_message(
+            message.chat.id,
+            result_text,
+            parse_mode="Markdown",
+            reply_markup=markup,
+        )
+        return
+
+    # Natijani ko'rsatish
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.add(BTN_BASIC_WHEEL, BTN_PREMIUM_WHEEL)
+    markup.add(BTN_BACK)
+
+    bot.send_message(
+        message.chat.id,
+        result["result_text"],
+        parse_mode="Markdown",
+        reply_markup=markup,
+    )
+    db.clear_session(uid)
+
+
+@bot.message_handler(func=lambda m: m.text == "🔄 Qayta aylantirish!" and _sess_state(m, "premium_wheel_mega_respin"))
+def on_premium_wheel_mega_respin_spin(message: types.Message) -> None:
+    """MEGA RE-SPIN uchun qayta aylantirish."""
+    uid = _user_id(message)
+    if uid is None:
+        return
+
+    # BEPUL aylantirish (MEGA RE-SPIN)
+    result = wheel.spin_premium_wheel(uid)
+
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.add(BTN_BASIC_WHEEL, BTN_PREMIUM_WHEEL)
+    markup.add(BTN_BACK)
+
+    bot.send_message(
+        message.chat.id,
+        result["result_text"],
+        parse_mode="Markdown",
+        reply_markup=markup,
+    )
+    db.clear_session(uid)
+
+
 # ── Vocabulary Booster ────────────────────────────────────────────────────
 
 @bot.message_handler(func=lambda m: m.text == BTN_VOCAB)
@@ -1890,6 +2190,14 @@ def on_group_report_period(message: types.Message) -> None:
 
 
 def run_bot() -> None:
+    import time
     logging.basicConfig(level=logging.INFO)
     db.init_db()
-    bot.infinity_polling(skip_pending=True, interval=1, timeout=60)
+    logger.info("Bot ishga tushdi...")
+
+    while True:
+        try:
+            bot.infinity_polling(skip_pending=True, interval=1, timeout=60)
+        except Exception as e:
+            logger.error(f"Polling xatosi: {e}. 5 soniyada qayta uriniladi...")
+            time.sleep(5)

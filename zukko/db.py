@@ -146,6 +146,18 @@ def init_db() -> None:
                 detail_json TEXT
             )"""
         )
+        c.execute(
+            """CREATE TABLE IF NOT EXISTS user_rewards (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                reward_type TEXT NOT NULL,
+                wheel_type TEXT NOT NULL,
+                granted_at TEXT NOT NULL,
+                expires_at TEXT,
+                used INTEGER DEFAULT 0,
+                detail_json TEXT
+            )"""
+        )
         _migrate_users_columns(conn)
 
 
@@ -1002,3 +1014,117 @@ def get_student_stats_by_teacher(teacher_id: int) -> list[sqlite3.Row]:
             (teacher_id,),
         )
         return cur.fetchall()
+
+
+# =============================================================================
+# BARABAN (WHEEL) SOWG'ALAR BOSHQARUVI
+# =============================================================================
+
+
+def grant_reward(
+    user_id: int,
+    reward_type: str,
+    wheel_type: str,
+    expires_at: Optional[str] = None,
+    detail: Optional[dict] = None,
+) -> int:
+    """
+    Foydalanuvchiga sovg'a berish.
+    reward_type: 'vocab_booster', 'writing_one_shot', 'paraphrase_day',
+                 'coins_10', 'tutor_day', 're_spin', 'writing_pro',
+                 'vocab_king', 'jackpot', 'lucky_days', 'mega_re_spin'
+    wheel_type: 'basic' yoki 'premium'
+    expires_at: ISO format yoki None (abadiy)
+    """
+    now = datetime.utcnow().isoformat() + "Z"
+    detail_json = json.dumps(detail, ensure_ascii=False) if detail else None
+    with get_conn() as conn:
+        cur = conn.execute(
+            """INSERT INTO user_rewards (user_id, reward_type, wheel_type, granted_at, expires_at, used, detail_json)
+               VALUES (?, ?, ?, ?, ?, 0, ?)""",
+            (user_id, reward_type, wheel_type, now, expires_at, detail_json),
+        )
+        return int(cur.lastrowid)
+
+
+def get_active_rewards(user_id: int, now: Optional[str] = None) -> list[sqlite3.Row]:
+    """Hozirda amal qilayotgan sovg'alarni qaytaradi."""
+    if now is None:
+        now = datetime.utcnow().isoformat() + "Z"
+    with get_conn() as conn:
+        cur = conn.execute(
+            """SELECT * FROM user_rewards
+               WHERE user_id = ? AND used = 0
+                 AND (expires_at IS NULL OR expires_at > ?)
+               ORDER BY granted_at DESC""",
+            (user_id, now),
+        )
+        return cur.fetchall()
+
+
+def has_active_reward(user_id: int, reward_type: str) -> bool:
+    """Foydalanuvchida ma'lum bir sovg'a bormi tekshiradi."""
+    now = datetime.utcnow().isoformat() + "Z"
+    with get_conn() as conn:
+        cur = conn.execute(
+            """SELECT COUNT(*) as c FROM user_rewards
+               WHERE user_id = ? AND reward_type = ? AND used = 0
+                 AND (expires_at IS NULL OR expires_at > ?)""",
+            (user_id, reward_type, now),
+        )
+        row = cur.fetchone()
+        return bool(row and row["c"] > 0)
+
+
+def consume_single_use_reward(user_id: int, reward_type: str) -> bool:
+    """Bir martalik sovg'ani ishlatilgan deb belgilaydi. True = muvaffaqiyatli."""
+    now = datetime.utcnow().isoformat() + "Z"
+    with get_conn() as conn:
+        conn.execute(
+            """UPDATE user_rewards SET used = 1
+               WHERE user_id = ? AND reward_type = ? AND used = 0
+                 AND (expires_at IS NULL OR expires_at > ?)
+               LIMIT 1""",
+            (user_id, reward_type, now),
+        )
+        return conn.total_changes > 0  # pyright: ignore[reportAttributeAccessIssue]
+
+
+def spin_wheel_result(
+    user_id: int,
+    wheel_type: str,
+    reward_type: str,
+    reward_detail: Optional[dict] = None,
+) -> dict:
+    """
+    Baraban aylantirish natijasini saqlaydi va sovg'ani beradi.
+    Qaysi sovg'a tushganini va qachon tugashini hisoblaydi.
+    """
+    now = datetime.utcnow()
+    granted_at = now.isoformat() + "Z"
+
+    # Har bir sovg'a uchun amal qilish muddati
+    expiry_map = {
+        "paraphrase_day": now + timedelta(hours=24),
+        "tutor_day": now + timedelta(hours=24),
+        "writing_pro": now + timedelta(days=2),
+        "vocab_king": now + timedelta(days=3),
+        "lucky_days": now + timedelta(days=3),
+        "jackpot": now + timedelta(weeks=1),
+        "vocab_booster": None,  # bir martalik
+        "writing_one_shot": None,  # bir martalik
+        "coins_10": None,  # darhol qo'shiladi
+        "re_spin": None,  # darhol qo'shiladi
+        "mega_re_spin": None,  # darhol qo'shiladi
+    }
+    expires_at = expiry_map.get(reward_type)
+    expires_iso = expires_at.isoformat() + "Z" if expires_at else None
+
+    reward_id = grant_reward(user_id, reward_type, wheel_type, expires_iso, reward_detail)
+    return {
+        "reward_id": reward_id,
+        "reward_type": reward_type,
+        "wheel_type": wheel_type,
+        "granted_at": granted_at,
+        "expires_at": expires_iso,
+    }
